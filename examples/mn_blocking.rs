@@ -1,23 +1,22 @@
-use mygoroutine::mn::Runtime;
+use mygoroutine::mn::{go, start_runtime};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn main() {
-    let num_threads = 4;
-    let num_tasks = 32;
+const NUM_THREADS: usize = 4;
+const NUM_TASKS: usize = 32;
 
+fn main() {
     println!(
         "=== M:N Runtime ({} threads) with blocking I/O ===",
-        num_threads
+        NUM_THREADS
     );
-    println!("Running {} tasks that each block for 100ms", num_tasks);
+    println!("Running {} tasks that each block for 100ms", NUM_TASKS);
     println!();
 
     let start = Instant::now();
-    let runtime = Runtime::new(num_threads);
 
-    for i in 0..num_tasks {
-        runtime.go(move || {
+    for i in 0..NUM_TASKS {
+        go(move || {
             println!(
                 "[{:>6.3}s] Task {} started",
                 start.elapsed().as_secs_f64(),
@@ -31,7 +30,7 @@ fn main() {
         });
     }
 
-    runtime.run();
+    start_runtime(NUM_THREADS);
 
     println!();
     println!("Total elapsed: {:?}", start.elapsed());

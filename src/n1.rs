@@ -1,10 +1,28 @@
 //! N:1 Green Thread Runtime
 //!
 //! Single-threaded green thread runtime using hand-written asm context switch.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use mygoroutine::n1::{go, start_runtime, gosched};
+//!
+//! go(|| {
+//!     println!("Task 1");
+//!     gosched();
+//!     println!("Task 1 done");
+//! });
+//!
+//! go(|| {
+//!     println!("Task 2");
+//! });
+//!
+//! start_runtime();
+//! ```
 
 use crate::context::{Context, STACK_SIZE, context_switch};
 use std::arch::asm;
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ptr;
 
@@ -92,24 +110,24 @@ where
 
 /// Called when a task completes
 fn task_finished() {
-    // Get the runtime pointer and release the borrow immediately
-    // (before context switch, which never returns to this stack frame)
-    let runtime_ptr = RUNTIME.with(|rt| *rt.borrow());
-
-    if let Some(runtime) = runtime_ptr {
-        unsafe {
-            (*runtime).current_task_finished = true;
-            (*runtime).switch_to_scheduler();
-        }
+    unsafe {
+        let rt = runtime();
+        (*rt).current_task_finished = true;
+        (*rt).switch_to_scheduler();
     }
 }
 
 thread_local! {
-    static RUNTIME: RefCell<Option<*mut Runtime>> = const { RefCell::new(None) };
+    static RUNTIME: UnsafeCell<Runtime> = UnsafeCell::new(Runtime::new());
 }
 
-/// N:1 Green Thread Runtime
-pub struct Runtime {
+/// Get a raw pointer to the runtime (unsafe, but avoids RefCell borrow issues during context switch)
+fn runtime() -> *mut Runtime {
+    RUNTIME.with(|rt| rt.get())
+}
+
+/// N:1 Green Thread Runtime (internal)
+struct Runtime {
     /// Queue of runnable tasks
     tasks: VecDeque<Task>,
     /// Context to return to when a task yields
@@ -118,68 +136,19 @@ pub struct Runtime {
     current_task: Option<Task>,
     /// Flag set by task_finished()
     current_task_finished: bool,
+    /// Flag to track if run() is currently executing
+    running: bool,
 }
 
 impl Runtime {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Runtime {
             tasks: VecDeque::new(),
             scheduler_context: Context::default(),
             current_task: None,
             current_task_finished: false,
+            running: false,
         }
-    }
-
-    /// Spawn a new green thread
-    pub fn go<F>(&mut self, f: F)
-    where
-        F: FnOnce() + 'static,
-    {
-        let task = Task::new(f);
-        self.tasks.push_back(task);
-    }
-
-    /// Run the scheduler until all tasks complete
-    pub fn run(&mut self) {
-        // Register this runtime in thread-local storage
-        RUNTIME.with(|rt| {
-            *rt.borrow_mut() = Some(self as *mut Runtime);
-        });
-
-        loop {
-            // Get the next task
-            let Some(task) = self.tasks.pop_front() else {
-                break;
-            };
-
-            if task.finished {
-                continue;
-            }
-
-            // Move task to current_task
-            self.current_task = Some(task);
-            self.current_task_finished = false;
-
-            // Switch to the task
-            let task_ctx = &self.current_task.as_ref().unwrap().context as *const Context;
-            context_switch(&mut self.scheduler_context, task_ctx);
-
-            // We're back! Task either yielded or finished
-            if let Some(mut task) = self.current_task.take() {
-                if self.current_task_finished {
-                    task.finished = true;
-                    // Task is dropped here
-                } else {
-                    // Task yielded, put it back in the queue
-                    self.tasks.push_back(task);
-                }
-            }
-        }
-
-        // Cleanup
-        RUNTIME.with(|rt| {
-            *rt.borrow_mut() = None;
-        });
     }
 
     /// Switch from current task back to scheduler
@@ -188,49 +157,77 @@ impl Runtime {
             context_switch(&mut task.context, &self.scheduler_context);
         }
     }
+}
 
-    /// Spawn a new task (called from within a running task)
-    fn spawn<F>(&mut self, f: F)
-    where
-        F: FnOnce() + 'static,
-    {
+/// Spawn a new green thread
+///
+/// Can be called either before `run()` to register initial tasks,
+/// or from within a running task to spawn child tasks.
+pub fn go<F>(f: F)
+where
+    F: FnOnce() + 'static,
+{
+    unsafe {
+        let rt = runtime();
         let task = Task::new(f);
-        self.tasks.push_back(task);
+        (*rt).tasks.push_back(task);
     }
 }
 
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new()
+/// Start the runtime and run until all tasks complete
+///
+/// Panics if called while already running.
+pub fn start_runtime() {
+    unsafe {
+        let rt = runtime();
+
+        // Check if already running
+        if (*rt).running {
+            panic!("run() called while already running");
+        }
+        (*rt).running = true;
+
+        loop {
+            // Get the next task
+            let Some(task) = (*rt).tasks.pop_front() else {
+                break;
+            };
+
+            if task.finished {
+                continue;
+            }
+
+            // Move task to current_task
+            (*rt).current_task = Some(task);
+            (*rt).current_task_finished = false;
+
+            // Switch to the task
+            let task_ctx = &(*rt).current_task.as_ref().unwrap().context as *const Context;
+            context_switch(&mut (*rt).scheduler_context, task_ctx);
+
+            // We're back! Task either yielded or finished
+            if let Some(mut task) = (*rt).current_task.take() {
+                if (*rt).current_task_finished {
+                    task.finished = true;
+                    // Task is dropped here
+                } else {
+                    // Task yielded, put it back in the queue
+                    (*rt).tasks.push_back(task);
+                }
+            }
+        }
+
+        // Cleanup
+        (*rt).running = false;
     }
 }
 
 /// Yield execution to another green thread
 pub fn gosched() {
-    RUNTIME.with(|rt| {
-        let rt_ptr = rt.borrow();
-        if let Some(runtime) = rt_ptr.as_ref() {
-            unsafe {
-                (**runtime).switch_to_scheduler();
-            }
+    unsafe {
+        let rt = runtime();
+        if (*rt).running {
+            (*rt).switch_to_scheduler();
         }
-    });
-}
-
-/// Spawn a new green thread from within a running task
-///
-/// Panics if called outside of a task context.
-pub fn go<F>(f: F)
-where
-    F: FnOnce() + 'static,
-{
-    let runtime_ptr = RUNTIME.with(|rt| *rt.borrow());
-
-    if let Some(runtime) = runtime_ptr {
-        unsafe {
-            (*runtime).spawn(f);
-        }
-    } else {
-        panic!("go() called outside of runtime context");
     }
 }

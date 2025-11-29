@@ -1,27 +1,27 @@
-use mygoroutine::mn::{Runtime, gosched};
+use mygoroutine::mn::{go, gosched, start_runtime};
+
+const NUM_THREADS: usize = 4;
 
 fn main() {
-    let runtime = Runtime::new(4); // 4 worker threads
-
-    runtime.go(|| {
+    go(|| {
         println!("Task 1: start");
         gosched();
         println!("Task 1: end");
     });
 
-    runtime.go(|| {
+    go(|| {
         println!("Task 2: start");
         gosched();
         println!("Task 2: end");
     });
 
-    runtime.go(|| {
+    go(|| {
         println!("Task 3: start");
         gosched();
         println!("Task 3: end");
     });
 
-    println!("Running scheduler with 4 threads...");
-    runtime.run();
+    println!("Starting runtime with {} threads...", NUM_THREADS);
+    start_runtime(NUM_THREADS);
     println!("All tasks completed!");
 }

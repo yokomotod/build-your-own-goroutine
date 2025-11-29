@@ -1,14 +1,13 @@
-use mygoroutine::n1::{Runtime, go, gosched};
+use mygoroutine::n1::{go, gosched, start_runtime};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 fn main() {
-    let mut runtime = Runtime::new();
     let counter = Rc::new(RefCell::new(0));
 
     // Spawn initial task
     let counter_clone = Rc::clone(&counter);
-    runtime.go(move || {
+    go(move || {
         println!("Parent task started");
 
         // Spawn child tasks from within the parent task!
@@ -25,7 +24,7 @@ fn main() {
         println!("Parent task done (spawned 5 children)");
     });
 
-    println!("Running scheduler...");
-    runtime.run();
+    println!("Starting runtime...");
+    start_runtime();
     println!("All tasks completed! Counter = {}", counter.borrow());
 }

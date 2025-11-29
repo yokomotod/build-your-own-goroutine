@@ -1,4 +1,4 @@
-use mygoroutine::n1::{Runtime, gosched};
+use mygoroutine::n1::{go, gosched, start_runtime};
 use std::time::Instant;
 
 fn main() {
@@ -8,11 +8,10 @@ fn main() {
         start.elapsed().as_secs_f64()
     );
 
-    let mut runtime = Runtime::new();
     let task_count = 100_000;
 
     for i in 0..task_count {
-        runtime.go(move || {
+        go(move || {
             // Simple computation
             let _ = i * 2;
             gosched();
@@ -28,10 +27,10 @@ fn main() {
     }
 
     println!(
-        "[{:>8.3}s] Running scheduler...",
+        "[{:>8.3}s] Starting runtime...",
         start.elapsed().as_secs_f64()
     );
-    runtime.run();
+    start_runtime();
     println!(
         "[{:>8.3}s] Done! All {} tasks completed.",
         start.elapsed().as_secs_f64(),

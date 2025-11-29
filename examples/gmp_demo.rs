@@ -1,27 +1,31 @@
-use mygoroutine::gmp::{Runtime, gosched};
+use mygoroutine::gmp::{go, gosched, start_runtime};
+
+const NUM_PROCESSORS: usize = 4; // P: logical processors
+const NUM_WORKERS: usize = 16; // M: OS threads
 
 fn main() {
-    let runtime = Runtime::new(4, 16); // P=4, M=16
-
-    runtime.go(|| {
+    go(|| {
         println!("Task 1: start");
         gosched();
         println!("Task 1: end");
     });
 
-    runtime.go(|| {
+    go(|| {
         println!("Task 2: start");
         gosched();
         println!("Task 2: end");
     });
 
-    runtime.go(|| {
+    go(|| {
         println!("Task 3: start");
         gosched();
         println!("Task 3: end");
     });
 
-    println!("Running GMP scheduler with 4 processors...");
-    runtime.run();
+    println!(
+        "Running GMP scheduler with {} processors...",
+        NUM_PROCESSORS
+    );
+    start_runtime(NUM_PROCESSORS, NUM_WORKERS);
     println!("All tasks completed!");
 }

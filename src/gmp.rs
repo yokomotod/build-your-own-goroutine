@@ -2,13 +2,32 @@
 //!
 //! Multi-threaded green thread runtime with Processor (P) and M-P handoff.
 //! This is similar to Go's GMP scheduler model.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use mygoroutine::gmp::{go, start_runtime};
+//!
+//! const NUM_PROCESSORS: usize = 4;
+//! const NUM_WORKERS: usize = 16;
+//!
+//! go(|| {
+//!     println!("Task 1");
+//! });
+//!
+//! go(|| {
+//!     println!("Task 2");
+//! });
+//!
+//! start_runtime(NUM_PROCESSORS, NUM_WORKERS);
+//! ```
 
 use crate::context::{Context, STACK_SIZE, context_switch};
 use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ptr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
 /// A green thread task (G in GMP)
@@ -193,24 +212,19 @@ struct Shared {
     work_available: Condvar,
 }
 
-pub struct Runtime {
-    #[allow(dead_code)]
-    num_processors: usize,
-    num_workers: usize,
-    shared: Arc<Shared>,
-}
+/// Global shared state
+static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
-impl Runtime {
-    pub fn new(num_processors: usize, num_workers: usize) -> Self {
-        let mut idle_processors = VecDeque::new();
-        for _ in 0..num_processors {
-            idle_processors.push_back(Processor::new());
-        }
+/// Get or initialize the global shared state
+fn get_or_init_shared(num_processors: usize) -> Arc<Shared> {
+    SHARED
+        .get_or_init(|| {
+            let mut idle_processors = VecDeque::new();
+            for _ in 0..num_processors {
+                idle_processors.push_back(Processor::new());
+            }
 
-        Runtime {
-            num_processors,
-            num_workers,
-            shared: Arc::new(Shared {
+            Arc::new(Shared {
                 state: Mutex::new(SharedState {
                     idle_processors,
                     global_queue: VecDeque::new(),
@@ -219,36 +233,33 @@ impl Runtime {
                 }),
                 p_available: Condvar::new(),
                 work_available: Condvar::new(),
-            }),
-        }
-    }
+            })
+        })
+        .clone()
+}
 
-    pub fn go<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        let task = Task::new(f);
-        let mut shared = self.shared.state.lock().unwrap();
-        shared.global_queue.push_back(task);
-        self.shared.work_available.notify_one();
-    }
+/// Get the shared state (panics if not initialized)
+fn shared() -> Arc<Shared> {
+    SHARED
+        .get_or_init(|| {
+            // Default: 4 processors
+            let mut idle_processors = VecDeque::new();
+            for _ in 0..4 {
+                idle_processors.push_back(Processor::new());
+            }
 
-    pub fn run(&self) {
-        let mut handles = Vec::new();
-
-        // Start worker threads (M in GMP model)
-        for worker_id in 0..self.num_workers {
-            let shared = Arc::clone(&self.shared);
-            let handle = thread::spawn(move || {
-                worker_loop(worker_id, shared);
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
+            Arc::new(Shared {
+                state: Mutex::new(SharedState {
+                    idle_processors,
+                    global_queue: VecDeque::new(),
+                    shutdown: false,
+                    active_workers: 0,
+                }),
+                p_available: Condvar::new(),
+                work_available: Condvar::new(),
+            })
+        })
+        .clone()
 }
 
 fn worker_loop(worker_id: usize, shared: Arc<Shared>) {
@@ -359,6 +370,52 @@ fn run_task(worker: &mut Worker, task: Task) {
     }
 }
 
+/// Spawn a new green thread
+///
+/// Can be called either before `start_runtime()` to register initial tasks,
+/// or from within a running task to spawn child tasks.
+pub fn go<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    // If we're inside a worker, use the worker's spawn
+    let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
+    if let Some(worker) = worker_ptr {
+        unsafe {
+            (*worker).spawn(f);
+        }
+        return;
+    }
+
+    // Otherwise, add to global shared queue
+    let task = Task::new(f);
+    let shared = shared();
+    shared.state.lock().unwrap().global_queue.push_back(task);
+    shared.work_available.notify_one();
+}
+
+/// Start the runtime and run until all tasks complete
+///
+/// Panics if called while already running.
+pub fn start_runtime(num_processors: usize, num_workers: usize) {
+    let shared = get_or_init_shared(num_processors);
+
+    let mut handles = Vec::new();
+
+    // Start worker threads (M in GMP model)
+    for worker_id in 0..num_workers {
+        let shared = Arc::clone(&shared);
+        let handle = thread::spawn(move || {
+            worker_loop(worker_id, shared);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
 /// Yield execution to another green thread
 pub fn gosched() {
     let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
@@ -367,24 +424,6 @@ pub fn gosched() {
         unsafe {
             (*worker).switch_to_scheduler();
         }
-    }
-}
-
-/// Spawn a new green thread from within a running task
-///
-/// Panics if called outside of a task context.
-pub fn go<F>(f: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
-
-    if let Some(worker) = worker_ptr {
-        unsafe {
-            (*worker).spawn(f);
-        }
-    } else {
-        panic!("go() called outside of runtime context");
     }
 }
 

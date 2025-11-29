@@ -1,13 +1,31 @@
 //! M:N Green Thread Runtime
 //!
 //! Multi-threaded green thread runtime using hand-written asm context switch.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use mygoroutine::mn::{go, start_runtime};
+//!
+//! const NUM_THREADS: usize = 4;
+//!
+//! go(|| {
+//!     println!("Task 1");
+//! });
+//!
+//! go(|| {
+//!     println!("Task 2");
+//! });
+//!
+//! start_runtime(NUM_THREADS);
+//! ```
 
 use crate::context::{Context, STACK_SIZE, context_switch};
 use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 /// A green thread task
@@ -144,46 +162,19 @@ struct SharedQueue {
     shutdown: bool,
 }
 
-pub struct Runtime {
-    num_threads: usize,
-    shared: Arc<Mutex<SharedQueue>>,
-}
+/// Global shared queue
+static SHARED: OnceLock<Arc<Mutex<SharedQueue>>> = OnceLock::new();
 
-impl Runtime {
-    pub fn new(num_threads: usize) -> Self {
-        Runtime {
-            num_threads,
-            shared: Arc::new(Mutex::new(SharedQueue {
+/// Get or initialize the global shared queue
+fn shared() -> Arc<Mutex<SharedQueue>> {
+    SHARED
+        .get_or_init(|| {
+            Arc::new(Mutex::new(SharedQueue {
                 pending: VecDeque::new(),
                 shutdown: false,
-            })),
-        }
-    }
-
-    pub fn go<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        let task = Task::new(f);
-        let mut queue = self.shared.lock().unwrap();
-        queue.pending.push_back(task);
-    }
-
-    pub fn run(&self) {
-        let mut handles = Vec::new();
-
-        for worker_id in 0..self.num_threads {
-            let shared = Arc::clone(&self.shared);
-            let handle = thread::spawn(move || {
-                worker_loop(worker_id, shared);
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
+            }))
+        })
+        .clone()
 }
 
 fn worker_loop(worker_id: usize, shared: Arc<Mutex<SharedQueue>>) {
@@ -242,6 +233,49 @@ fn worker_loop(worker_id: usize, shared: Arc<Mutex<SharedQueue>>) {
     println!("[Worker {}] Shutting down", worker_id);
 }
 
+/// Spawn a new green thread
+///
+/// Can be called either before `start_runtime()` to register initial tasks,
+/// or from within a running task to spawn child tasks.
+pub fn go<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    // If we're inside a worker, use the worker's spawn
+    let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
+    if let Some(worker) = worker_ptr {
+        unsafe {
+            (*worker).spawn(f);
+        }
+        return;
+    }
+
+    // Otherwise, add to global shared queue
+    let task = Task::new(f);
+    shared().lock().unwrap().pending.push_back(task);
+}
+
+/// Start the runtime and run until all tasks complete
+///
+/// Panics if called while already running.
+pub fn start_runtime(num_threads: usize) {
+    let shared = shared();
+
+    let mut handles = Vec::new();
+
+    for worker_id in 0..num_threads {
+        let shared = Arc::clone(&shared);
+        let handle = thread::spawn(move || {
+            worker_loop(worker_id, shared);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
 /// Yield execution to another green thread
 pub fn gosched() {
     let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
@@ -250,23 +284,5 @@ pub fn gosched() {
         unsafe {
             (*worker).switch_to_scheduler();
         }
-    }
-}
-
-/// Spawn a new green thread from within a running task
-///
-/// Panics if called outside of a task context.
-pub fn go<F>(f: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
-
-    if let Some(worker) = worker_ptr {
-        unsafe {
-            (*worker).spawn(f);
-        }
-    } else {
-        panic!("go() called outside of runtime context");
     }
 }

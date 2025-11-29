@@ -1,4 +1,4 @@
-use mygoroutine::n1::Runtime;
+use mygoroutine::n1::{go, start_runtime};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -21,16 +21,15 @@ fn main() {
     println!();
 
     let start = Instant::now();
-    let runtime = Runtime::new();
 
     for i in 0..num_tasks {
-        runtime.go(move || {
+        go(move || {
             let result = cpu_work(work_size);
             println!("Task {}: result = {}", i, result);
         });
     }
 
-    runtime.run();
+    start_runtime();
     println!();
     println!("Elapsed: {:?}", start.elapsed());
 }

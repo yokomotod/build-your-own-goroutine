@@ -1,27 +1,25 @@
-use mygoroutine::n1::{Runtime, gosched};
+use mygoroutine::n1::{go, gosched, start_runtime};
 
 fn main() {
-    let mut runtime = Runtime::new();
-
-    runtime.go(|| {
+    go(|| {
         println!("Task 1: start");
         gosched();
         println!("Task 1: end");
     });
 
-    runtime.go(|| {
+    go(|| {
         println!("Task 2: start");
         gosched();
         println!("Task 2: end");
     });
 
-    runtime.go(|| {
+    go(|| {
         println!("Task 3: start");
         gosched();
         println!("Task 3: end");
     });
 
-    println!("Running scheduler...");
-    runtime.run();
+    println!("Starting runtime...");
+    start_runtime();
     println!("All tasks completed!");
 }

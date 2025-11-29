@@ -1,24 +1,23 @@
-use mygoroutine::gmp::{Runtime, io};
+use mygoroutine::gmp::{go, io, start_runtime};
 use std::time::Instant;
 
-fn main() {
-    let num_processors = 4; // P: logical processors
-    let num_workers = 16; // M: OS threads
-    let num_tasks = 32;
+const NUM_PROCESSORS: usize = 4; // P: logical processors
+const NUM_WORKERS: usize = 16; // M: OS threads
+const NUM_TASKS: usize = 32;
 
+fn main() {
     println!(
         "=== GMP Runtime (P={}, M={}) with blocking I/O ===",
-        num_processors, num_workers
+        NUM_PROCESSORS, NUM_WORKERS
     );
-    println!("Running {} tasks that each block for 100ms", num_tasks);
+    println!("Running {} tasks that each block for 100ms", NUM_TASKS);
     println!("Using io::sleep() which releases P during blocking");
     println!();
 
     let start = Instant::now();
-    let runtime = Runtime::new(num_processors, num_workers);
 
-    for i in 0..num_tasks {
-        runtime.go(move || {
+    for i in 0..NUM_TASKS {
+        go(move || {
             println!(
                 "[{:>6.3}s] Task {} started",
                 start.elapsed().as_secs_f64(),
@@ -32,7 +31,7 @@ fn main() {
         });
     }
 
-    runtime.run();
+    start_runtime(NUM_PROCESSORS, NUM_WORKERS);
 
     println!();
     println!("Total elapsed: {:?}", start.elapsed());

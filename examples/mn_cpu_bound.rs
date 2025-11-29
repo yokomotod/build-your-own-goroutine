@@ -1,6 +1,10 @@
-use mygoroutine::mn::Runtime;
+use mygoroutine::mn::{go, start_runtime};
 use std::hint::black_box;
 use std::time::Instant;
+
+const NUM_THREADS: usize = 4;
+const NUM_TASKS: usize = 8;
+const WORK_SIZE: u64 = 50_000_000;
 
 /// CPU-intensive work: compute sum of squares
 fn cpu_work(n: u64) -> u64 {
@@ -12,26 +16,21 @@ fn cpu_work(n: u64) -> u64 {
 }
 
 fn main() {
-    let work_size = 50_000_000u64;
-    let num_tasks = 8;
-    let num_threads = 4;
-
-    println!("=== M:N Runtime ({} threads) ===", num_threads);
-    println!("Running {} tasks with work_size = {}", num_tasks, work_size);
+    println!("=== M:N Runtime ({} threads) ===", NUM_THREADS);
+    println!("Running {} tasks with work_size = {}", NUM_TASKS, WORK_SIZE);
     println!("Watch CPU usage with: htop or top");
     println!();
 
     let start = Instant::now();
-    let runtime = Runtime::new(num_threads);
 
-    for i in 0..num_tasks {
-        runtime.go(move || {
-            let result = cpu_work(work_size);
+    for i in 0..NUM_TASKS {
+        go(move || {
+            let result = cpu_work(WORK_SIZE);
             println!("Task {}: result = {}", i, result);
         });
     }
 
-    runtime.run();
+    start_runtime(NUM_THREADS);
     println!();
     println!("Elapsed: {:?}", start.elapsed());
 }
