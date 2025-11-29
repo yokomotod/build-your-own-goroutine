@@ -1,32 +1,12 @@
-//! N:1 Green Thread Runtime with hand-written context switch
+//! N:1 Green Thread Runtime
 //!
-//! This module implements a simple N:1 (many-to-one) green thread runtime
-//! using inline assembly for context switching.
+//! Single-threaded green thread runtime using hand-written asm context switch.
 
-use std::arch::{asm, naked_asm};
+use crate::context::{Context, STACK_SIZE, context_switch};
+use std::arch::asm;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ptr;
-
-/// Stack size for each green thread (64KB)
-const STACK_SIZE: usize = 64 * 1024;
-
-/// Saved CPU context for context switching
-///
-/// On x86_64 System V ABI, these are the callee-saved registers
-/// that must be preserved across function calls.
-#[repr(C)]
-#[derive(Debug, Clone, Default)]
-struct Context {
-    // Callee-saved registers (must be preserved)
-    rsp: u64, // Stack pointer
-    rbp: u64, // Frame pointer
-    rbx: u64, // General purpose
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-}
 
 /// A green thread task
 struct Task {
@@ -48,16 +28,12 @@ impl Task {
         let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
 
         // Align stack to 16 bytes (required by System V ABI)
-        // After our setup, when task_entry is called, RSP should be 16-byte aligned
         let stack_top = stack_top & !0xF;
 
         // Box the closure and leak it to get a raw pointer
         let f_ptr = Box::into_raw(Box::new(f));
 
         // Set up initial stack:
-        // The context_switch function will do `ret` which pops the return address.
-        // We want it to jump to task_entry.
-        //
         // System V ABI requires RSP to be 16-byte aligned BEFORE `call` instruction.
         // After `call`, RSP becomes 16n+8 (due to pushed return address).
         // Since we use `ret` instead of `call`, we need to simulate this:
@@ -91,7 +67,6 @@ impl Task {
 
 /// Entry point for new tasks
 ///
-/// This function is called when a task is first resumed.
 /// The closure pointer is passed in r15.
 extern "C" fn task_entry<F>()
 where
@@ -127,36 +102,6 @@ fn task_finished() {
             (*runtime).switch_to_scheduler();
         }
     }
-}
-
-/// Switch from one context to another
-///
-/// Saves the current CPU state into `old` and restores state from `new`.
-/// This function returns when another context switches back to `old`.
-#[unsafe(naked)]
-extern "C" fn context_switch(old: *mut Context, new: *const Context) {
-    naked_asm!(
-        // Save callee-saved registers to old context
-        "mov [rdi + 0x00], rsp",
-        "mov [rdi + 0x08], rbp",
-        "mov [rdi + 0x10], rbx",
-        "mov [rdi + 0x18], r12",
-        "mov [rdi + 0x20], r13",
-        "mov [rdi + 0x28], r14",
-        "mov [rdi + 0x30], r15",
-        // Load callee-saved registers from new context
-        "mov rsp, [rsi + 0x00]",
-        "mov rbp, [rsi + 0x08]",
-        "mov rbx, [rsi + 0x10]",
-        "mov r12, [rsi + 0x18]",
-        "mov r13, [rsi + 0x20]",
-        "mov r14, [rsi + 0x28]",
-        "mov r15, [rsi + 0x30]",
-        // Return to the new context
-        // For a fresh task: pops task_entry address and jumps there
-        // For a yielded task: returns to where it called context_switch
-        "ret",
-    );
 }
 
 thread_local! {
