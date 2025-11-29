@@ -1,4 +1,4 @@
-use mygoroutine::{Runtime, gosched};
+use mygoroutine::n1::{Runtime, gosched};
 
 fn main() {
     let runtime = Runtime::new();

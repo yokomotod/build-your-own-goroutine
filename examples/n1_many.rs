@@ -1,4 +1,4 @@
-use mygoroutine::{Runtime, gosched};
+use mygoroutine::n1::{Runtime, gosched};
 use std::time::Instant;
 
 fn main() {
