@@ -4,7 +4,7 @@ use std::time::Instant;
 
 const NUM_THREADS: usize = 4;
 const NUM_TASKS: usize = 8;
-const WORK_SIZE: u64 = 50_000_000;
+const WORK_SIZE: u64 = 7_500_000_000;
 
 /// CPU-intensive work: compute sum of squares
 fn cpu_work(n: u64) -> u64 {

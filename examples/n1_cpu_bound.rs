@@ -12,7 +12,7 @@ fn cpu_work(n: u64) -> u64 {
 }
 
 fn main() {
-    let work_size = 50_000_000u64;
+    let work_size = 7_500_000_000u64;
     let num_tasks = 8;
 
     println!("=== N:1 Runtime (single thread) ===");
