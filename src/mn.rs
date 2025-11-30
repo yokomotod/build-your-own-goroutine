@@ -1,16 +1,16 @@
 //! M:N Green Thread Runtime
 //!
-//! Multi-threaded green thread runtime using hand-written asm context switch.
-//!
 //! # Example
 //!
 //! ```no_run
-//! use mygoroutine::mn::{go, start_runtime};
+//! use mygoroutine::mn::{go, start_runtime, gosched};
 //!
 //! const NUM_THREADS: usize = 4;
 //!
 //! go(|| {
 //!     println!("Task 1");
+//!     gosched();
+//!     println!("Task 1 done");
 //! });
 //!
 //! go(|| {
@@ -31,9 +31,10 @@ struct Task {
     context: Context,
     #[allow(dead_code)]
     stack: Vec<u8>, // Keep stack alive
+    finished: bool,
 }
 
-// Task needs to be Send because it's moved between threads via the shared queue
+// Task needs to be Send because it's moved between threads via the global queue
 unsafe impl Send for Task {}
 
 impl Task {
@@ -55,11 +56,17 @@ impl Task {
 
         let context = Context::new_for_task(stack_top, task_entry::<F> as usize, f_ptr as u64);
 
-        Task { context, stack }
+        Task {
+            context,
+            stack,
+            finished: false,
+        }
     }
 }
 
 /// Entry point for new tasks
+///
+/// The closure pointer is passed via a callee-saved register.
 extern "C" fn task_entry<F>()
 where
     F: FnOnce() + Send + 'static,
@@ -80,7 +87,9 @@ fn task_finished() {
 
     if let Some(worker) = worker_ptr {
         unsafe {
-            (*worker).current_task_finished = true;
+            if let Some(ref mut task) = (*worker).current_task {
+                task.finished = true;
+            }
             (*worker).switch_to_scheduler();
         }
     }
@@ -92,23 +101,20 @@ thread_local! {
 
 /// Per-thread worker state
 struct Worker {
-    /// Scheduler context for this worker
-    scheduler_context: Context,
+    /// Context to return to when a task yields
+    context: Context,
     /// Currently running task
     current_task: Option<Task>,
-    /// Flag set by task_finished()
-    current_task_finished: bool,
-    /// Reference to shared queue for spawning new tasks
-    shared: Arc<Mutex<SharedQueue>>,
+    /// Reference to global queue for spawning new tasks
+    global_queue: Arc<Mutex<GlobalQueue>>,
 }
 
 impl Worker {
-    fn new(shared: Arc<Mutex<SharedQueue>>) -> Self {
+    fn new(global_queue: Arc<Mutex<GlobalQueue>>) -> Self {
         Worker {
-            scheduler_context: Context::default(),
+            context: Context::default(),
             current_task: None,
-            current_task_finished: false,
-            shared,
+            global_queue,
         }
     }
 
@@ -118,41 +124,41 @@ impl Worker {
         F: FnOnce() + Send + 'static,
     {
         let task = Task::new(f);
-        self.shared.lock().unwrap().pending.push_back(task);
+        self.global_queue.lock().unwrap().tasks.push_back(task);
     }
 
     unsafe fn switch_to_scheduler(&mut self) {
         if let Some(ref mut task) = self.current_task {
-            context_switch(&mut task.context, &self.scheduler_context);
+            context_switch(&mut task.context, &self.context);
         }
     }
 }
 
-/// Shared state for the M:N runtime
-struct SharedQueue {
-    /// Queue of pending tasks
-    pending: VecDeque<Task>,
+/// Global task queue shared by all workers
+struct GlobalQueue {
+    /// Queue of runnable tasks
+    tasks: VecDeque<Task>,
     /// Flag to signal shutdown
     shutdown: bool,
 }
 
-/// Global shared queue
-static SHARED: OnceLock<Arc<Mutex<SharedQueue>>> = OnceLock::new();
+/// Global task queue
+static GLOBAL_QUEUE: OnceLock<Arc<Mutex<GlobalQueue>>> = OnceLock::new();
 
-/// Get or initialize the global shared queue
-fn shared() -> Arc<Mutex<SharedQueue>> {
-    SHARED
+/// Get or initialize the global queue
+fn global_queue() -> Arc<Mutex<GlobalQueue>> {
+    GLOBAL_QUEUE
         .get_or_init(|| {
-            Arc::new(Mutex::new(SharedQueue {
-                pending: VecDeque::new(),
+            Arc::new(Mutex::new(GlobalQueue {
+                tasks: VecDeque::new(),
                 shutdown: false,
             }))
         })
         .clone()
 }
 
-fn worker_loop(worker_id: usize, shared: Arc<Mutex<SharedQueue>>) {
-    let mut worker = Worker::new(Arc::clone(&shared));
+fn worker_loop(worker_id: usize, global_queue: Arc<Mutex<GlobalQueue>>) {
+    let mut worker = Worker::new(Arc::clone(&global_queue));
 
     // Register this worker in thread-local storage
     CURRENT_WORKER.with(|w| {
@@ -160,11 +166,11 @@ fn worker_loop(worker_id: usize, shared: Arc<Mutex<SharedQueue>>) {
     });
 
     loop {
-        // Get task from global shared queue
+        // Get task from global queue
         let task = {
-            let mut queue = shared.lock().unwrap();
+            let mut queue = global_queue.lock().unwrap();
 
-            if let Some(task) = queue.pending.pop_front() {
+            if let Some(task) = queue.tasks.pop_front() {
                 task
             } else {
                 if queue.shutdown {
@@ -177,18 +183,18 @@ fn worker_loop(worker_id: usize, shared: Arc<Mutex<SharedQueue>>) {
 
         // Run the task
         worker.current_task = Some(task);
-        worker.current_task_finished = false;
 
         let task_ctx = &worker.current_task.as_ref().unwrap().context as *const Context;
-        context_switch(&mut worker.scheduler_context, task_ctx);
+        context_switch(&mut worker.context, task_ctx);
 
         // Task yielded or finished
         if let Some(task) = worker.current_task.take()
-            && !worker.current_task_finished {
-                // Task yielded, put back to global queue
-                shared.lock().unwrap().pending.push_back(task);
-            }
-            // If finished, just drop it
+            && !task.finished
+        {
+            // Task yielded, put back to global queue
+            global_queue.lock().unwrap().tasks.push_back(task);
+        }
+        // If finished, just drop it
     }
 
     // Cleanup
@@ -216,23 +222,23 @@ where
         return;
     }
 
-    // Otherwise, add to global shared queue
+    // Otherwise, add to global queue
     let task = Task::new(f);
-    shared().lock().unwrap().pending.push_back(task);
+    global_queue().lock().unwrap().tasks.push_back(task);
 }
 
 /// Start the runtime and run until all tasks complete
 ///
 /// Panics if called while already running.
 pub fn start_runtime(num_threads: usize) {
-    let shared = shared();
+    let global_queue = global_queue();
 
     let mut handles = Vec::new();
 
     for worker_id in 0..num_threads {
-        let shared = Arc::clone(&shared);
+        let global_queue = Arc::clone(&global_queue);
         let handle = thread::spawn(move || {
-            worker_loop(worker_id, shared);
+            worker_loop(worker_id, global_queue);
         });
         handles.push(handle);
     }

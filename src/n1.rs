@@ -1,7 +1,5 @@
 //! N:1 Green Thread Runtime
 //!
-//! Single-threaded green thread runtime using hand-written asm context switch.
-//!
 //! # Example
 //!
 //! ```no_run
@@ -67,79 +65,74 @@ where
     F: FnOnce() + 'static,
 {
     unsafe {
-        // Get the closure pointer from callee-saved register
         let f_ptr = get_closure_ptr();
 
-        // Take ownership of the closure and run it
         let f = Box::from_raw(f_ptr as *mut F);
         f();
     }
 
-    // Task finished - mark as done and yield back
     task_finished();
 }
 
 /// Called when a task completes
 fn task_finished() {
     unsafe {
-        let rt = runtime();
-        (*rt).current_task_finished = true;
-        (*rt).switch_to_scheduler();
+        let w = worker();
+        if let Some(ref mut task) = (*w).current_task {
+            task.finished = true;
+        }
+        (*w).switch_to_scheduler();
     }
 }
 
 thread_local! {
-    static RUNTIME: UnsafeCell<Runtime> = UnsafeCell::new(Runtime::new());
+    static WORKER: UnsafeCell<Worker> = UnsafeCell::new(Worker::new());
 }
 
-/// Get a raw pointer to the runtime (unsafe, but avoids RefCell borrow issues during context switch)
-fn runtime() -> *mut Runtime {
-    RUNTIME.with(|rt| rt.get())
+/// Get a raw pointer to the worker (unsafe, but avoids RefCell borrow issues during context switch)
+fn worker() -> *mut Worker {
+    WORKER.with(|rt| rt.get())
 }
 
-/// N:1 Green Thread Runtime (internal)
-struct Runtime {
+/// N:1 Green Thread Worker (internal)
+struct Worker {
     /// Queue of runnable tasks
     tasks: VecDeque<Task>,
     /// Context to return to when a task yields
-    scheduler_context: Context,
-    /// The currently running task (moved out of queue during execution)
+    context: Context,
+    /// Currently running task
     current_task: Option<Task>,
-    /// Flag set by task_finished()
-    current_task_finished: bool,
     /// Flag to track if run() is currently executing
     running: bool,
 }
 
-impl Runtime {
+impl Worker {
     fn new() -> Self {
-        Runtime {
+        Worker {
             tasks: VecDeque::new(),
-            scheduler_context: Context::default(),
+            context: Context::default(),
             current_task: None,
-            current_task_finished: false,
             running: false,
         }
     }
 
-    /// Switch from current task back to scheduler
     unsafe fn switch_to_scheduler(&mut self) {
         if let Some(ref mut task) = self.current_task {
-            context_switch(&mut task.context, &self.scheduler_context);
+            context_switch(&mut task.context, &self.context);
         }
     }
 }
 
 /// Spawn a new green thread
 ///
-/// Can be called either before `run()` to register initial tasks,
+/// Can be called either before `start_runtime()` to register initial tasks,
 /// or from within a running task to spawn child tasks.
 pub fn go<F>(f: F)
 where
     F: FnOnce() + 'static,
 {
     unsafe {
-        let rt = runtime();
+        let rt = worker();
         let task = Task::new(f);
         (*rt).tasks.push_back(task);
     }
@@ -150,7 +143,7 @@ where
 /// Panics if called while already running.
 pub fn start_runtime() {
     unsafe {
-        let rt = runtime();
+        let rt = worker();
 
         // Check if already running
         if (*rt).running {
@@ -164,28 +157,21 @@ pub fn start_runtime() {
                 break;
             };
 
-            if task.finished {
-                continue;
-            }
-
             // Move task to current_task
             (*rt).current_task = Some(task);
-            (*rt).current_task_finished = false;
 
             // Switch to the task
             let task_ctx = &(*rt).current_task.as_ref().unwrap().context as *const Context;
-            context_switch(&mut (*rt).scheduler_context, task_ctx);
+            context_switch(&mut (*rt).context, task_ctx);
 
             // We're back! Task either yielded or finished
-            if let Some(mut task) = (*rt).current_task.take() {
-                if (*rt).current_task_finished {
-                    task.finished = true;
-                    // Task is dropped here
-                } else {
-                    // Task yielded, put it back in the queue
-                    (*rt).tasks.push_back(task);
-                }
+            if let Some(task) = (*rt).current_task.take()
+                && !task.finished
+            {
+                // Task yielded, put it back in the queue
+                (*rt).tasks.push_back(task);
             }
+            // If finished, just drop it
         }
 
         // Cleanup
@@ -196,7 +182,7 @@ pub fn start_runtime() {
 /// Yield execution to another green thread
 pub fn gosched() {
     unsafe {
-        let rt = runtime();
+        let rt = worker();
         if (*rt).running {
             (*rt).switch_to_scheduler();
         }
