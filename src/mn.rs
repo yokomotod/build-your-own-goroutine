@@ -20,11 +20,9 @@
 //! start_runtime(NUM_THREADS);
 //! ```
 
-use crate::context::{Context, STACK_SIZE, context_switch};
-use std::arch::asm;
+use crate::context::{Context, STACK_SIZE, context_switch, get_closure_ptr};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -50,24 +48,13 @@ impl Task {
         // Stack grows downward, so we start at the top
         let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
 
-        // Align stack to 16 bytes (required by System V ABI)
+        // Align stack to 16 bytes (required by ABI)
         let stack_top = stack_top & !0xF;
 
         // Box the closure and leak it to get a raw pointer
         let f_ptr = Box::into_raw(Box::new(f));
 
-        // Set up initial stack (same as n1)
-        let initial_rsp = stack_top - 16;
-
-        unsafe {
-            ptr::write(initial_rsp as *mut u64, task_entry::<F> as usize as u64);
-        }
-
-        let context = Context {
-            rsp: initial_rsp as u64,
-            r15: f_ptr as u64,
-            ..Default::default()
-        };
+        let context = Context::new_for_task(stack_top, task_entry::<F> as usize, f_ptr as u64);
 
         Task {
             context,
@@ -83,12 +70,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     unsafe {
-        let f_ptr: u64;
-        asm!(
-            "mov {}, r15",
-            out(reg) f_ptr,
-            options(nomem, nostack, preserves_flags)
-        );
+        let f_ptr = get_closure_ptr();
 
         let f = Box::from_raw(f_ptr as *mut F);
         f();

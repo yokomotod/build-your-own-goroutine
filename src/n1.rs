@@ -20,11 +20,9 @@
 //! start_runtime();
 //! ```
 
-use crate::context::{Context, STACK_SIZE, context_switch};
-use std::arch::asm;
+use crate::context::{Context, STACK_SIZE, context_switch, get_closure_ptr};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::ptr;
 
 /// A green thread task
 struct Task {
@@ -45,35 +43,13 @@ impl Task {
         // Stack grows downward, so we start at the top
         let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
 
-        // Align stack to 16 bytes (required by System V ABI)
+        // Align stack to 16 bytes (required by ABI)
         let stack_top = stack_top & !0xF;
 
         // Box the closure and leak it to get a raw pointer
         let f_ptr = Box::into_raw(Box::new(f));
 
-        // Set up initial stack:
-        // System V ABI requires RSP to be 16-byte aligned BEFORE `call` instruction.
-        // After `call`, RSP becomes 16n+8 (due to pushed return address).
-        // Since we use `ret` instead of `call`, we need to simulate this:
-        //
-        // Stack layout (growing downward):
-        //   stack_top - 8:  (padding for alignment)
-        //   stack_top - 16: return address (task_entry)
-        //
-        // After `ret`: RSP = stack_top - 8, which is 16n+8 as required.
-
-        let initial_rsp = stack_top - 16;
-
-        unsafe {
-            // Write task_entry as the return address
-            ptr::write(initial_rsp as *mut u64, task_entry::<F> as usize as u64);
-        }
-
-        let context = Context {
-            rsp: initial_rsp as u64,
-            r15: f_ptr as u64, // Pass closure pointer via r15
-            ..Default::default()
-        };
+        let context = Context::new_for_task(stack_top, task_entry::<F> as usize, f_ptr as u64);
 
         Task {
             context,
@@ -85,19 +61,14 @@ impl Task {
 
 /// Entry point for new tasks
 ///
-/// The closure pointer is passed in r15.
+/// The closure pointer is passed via a callee-saved register.
 extern "C" fn task_entry<F>()
 where
     F: FnOnce() + 'static,
 {
     unsafe {
-        // Get the closure pointer from r15
-        let f_ptr: u64;
-        asm!(
-            "mov {}, r15",
-            out(reg) f_ptr,
-            options(nomem, nostack, preserves_flags)
-        );
+        // Get the closure pointer from callee-saved register
+        let f_ptr = get_closure_ptr();
 
         // Take ownership of the closure and run it
         let f = Box::from_raw(f_ptr as *mut F);
