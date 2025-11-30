@@ -23,8 +23,29 @@
 use crate::context::{Context, STACK_SIZE, context_switch, get_closure_ptr};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
+
+/// Global task queue
+static GLOBAL_QUEUE: OnceLock<Mutex<GlobalQueue>> = OnceLock::new();
+
+/// Get or initialize the global queue
+fn global_queue() -> &'static Mutex<GlobalQueue> {
+    GLOBAL_QUEUE.get_or_init(|| {
+        Mutex::new(GlobalQueue {
+            tasks: VecDeque::new(),
+            shutdown: false,
+        })
+    })
+}
+
+thread_local! {
+    static CURRENT_WORKER: RefCell<Option<*mut Worker>> = const { RefCell::new(None) };
+}
+
+fn current_worker() -> *mut Worker {
+    CURRENT_WORKER.with(|w| (*w.borrow()).unwrap())
+}
 
 /// A green thread task
 struct Task {
@@ -64,6 +85,17 @@ impl Task {
     }
 }
 
+/// Called when a task completes
+fn task_finished() {
+    unsafe {
+        let worker = current_worker();
+        if let Some(ref mut task) = (*worker).current_task {
+            task.finished = true;
+        }
+        (*worker).switch_to_scheduler();
+    }
+}
+
 /// Entry point for new tasks
 ///
 /// The closure pointer is passed via a callee-saved register.
@@ -81,22 +113,12 @@ where
     task_finished();
 }
 
-/// Called when a task completes
-fn task_finished() {
-    let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
-
-    if let Some(worker) = worker_ptr {
-        unsafe {
-            if let Some(ref mut task) = (*worker).current_task {
-                task.finished = true;
-            }
-            (*worker).switch_to_scheduler();
-        }
-    }
-}
-
-thread_local! {
-    static CURRENT_WORKER: RefCell<Option<*mut Worker>> = const { RefCell::new(None) };
+/// Global task queue shared by all workers
+struct GlobalQueue {
+    /// Queue of runnable tasks
+    tasks: VecDeque<Task>,
+    /// Flag to signal shutdown
+    shutdown: bool,
 }
 
 /// Per-thread worker state
@@ -105,26 +127,14 @@ struct Worker {
     context: Context,
     /// Currently running task
     current_task: Option<Task>,
-    /// Reference to global queue for spawning new tasks
-    global_queue: Arc<Mutex<GlobalQueue>>,
 }
 
 impl Worker {
-    fn new(global_queue: Arc<Mutex<GlobalQueue>>) -> Self {
+    fn new() -> Self {
         Worker {
             context: Context::default(),
             current_task: None,
-            global_queue,
         }
-    }
-
-    /// Spawn a new task from within this worker
-    fn spawn<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        let task = Task::new(f);
-        self.global_queue.lock().unwrap().tasks.push_back(task);
     }
 
     unsafe fn switch_to_scheduler(&mut self) {
@@ -134,31 +144,9 @@ impl Worker {
     }
 }
 
-/// Global task queue shared by all workers
-struct GlobalQueue {
-    /// Queue of runnable tasks
-    tasks: VecDeque<Task>,
-    /// Flag to signal shutdown
-    shutdown: bool,
-}
-
-/// Global task queue
-static GLOBAL_QUEUE: OnceLock<Arc<Mutex<GlobalQueue>>> = OnceLock::new();
-
-/// Get or initialize the global queue
-fn global_queue() -> Arc<Mutex<GlobalQueue>> {
-    GLOBAL_QUEUE
-        .get_or_init(|| {
-            Arc::new(Mutex::new(GlobalQueue {
-                tasks: VecDeque::new(),
-                shutdown: false,
-            }))
-        })
-        .clone()
-}
-
-fn worker_loop(worker_id: usize, global_queue: Arc<Mutex<GlobalQueue>>) {
-    let mut worker = Worker::new(Arc::clone(&global_queue));
+fn worker_loop(worker_id: usize) {
+    let mut worker = Worker::new();
+    let queue = global_queue();
 
     // Register this worker in thread-local storage
     CURRENT_WORKER.with(|w| {
@@ -168,15 +156,15 @@ fn worker_loop(worker_id: usize, global_queue: Arc<Mutex<GlobalQueue>>) {
     loop {
         // Get task from global queue
         let task = {
-            let mut queue = global_queue.lock().unwrap();
+            let mut q = queue.lock().unwrap();
 
-            if let Some(task) = queue.tasks.pop_front() {
+            if let Some(task) = q.tasks.pop_front() {
                 task
             } else {
-                if queue.shutdown {
+                if q.shutdown {
                     break;
                 }
-                queue.shutdown = true;
+                q.shutdown = true;
                 break;
             }
         };
@@ -192,7 +180,7 @@ fn worker_loop(worker_id: usize, global_queue: Arc<Mutex<GlobalQueue>>) {
             && !task.finished
         {
             // Task yielded, put back to global queue
-            global_queue.lock().unwrap().tasks.push_back(task);
+            queue.lock().unwrap().tasks.push_back(task);
         }
         // If finished, just drop it
     }
@@ -213,48 +201,32 @@ pub fn go<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    // If we're inside a worker, use the worker's spawn
-    let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
-    if let Some(worker) = worker_ptr {
-        unsafe {
-            (*worker).spawn(f);
-        }
-        return;
-    }
-
-    // Otherwise, add to global queue
     let task = Task::new(f);
     global_queue().lock().unwrap().tasks.push_back(task);
 }
 
+/// Yield execution to another green thread
+pub fn gosched() {
+    unsafe {
+        (*current_worker()).switch_to_scheduler();
+    }
+}
+
 /// Start the runtime and run until all tasks complete
 ///
-/// Panics if called while already running.
+/// # Warning
+/// Do not call this from within a running task.
 pub fn start_runtime(num_threads: usize) {
-    let global_queue = global_queue();
-
     let mut handles = Vec::new();
 
     for worker_id in 0..num_threads {
-        let global_queue = Arc::clone(&global_queue);
         let handle = thread::spawn(move || {
-            worker_loop(worker_id, global_queue);
+            worker_loop(worker_id);
         });
         handles.push(handle);
     }
 
     for handle in handles {
         handle.join().unwrap();
-    }
-}
-
-/// Yield execution to another green thread
-pub fn gosched() {
-    let worker_ptr = CURRENT_WORKER.with(|w| *w.borrow());
-
-    if let Some(worker) = worker_ptr {
-        unsafe {
-            (*worker).switch_to_scheduler();
-        }
     }
 }
