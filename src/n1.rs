@@ -18,7 +18,7 @@
 //! start_runtime();
 //! ```
 
-use crate::context::{Context, STACK_SIZE, context_switch, get_closure_ptr};
+use crate::common::{Context, Task, context_switch, get_closure_ptr, prepare_stack};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 
@@ -30,48 +30,15 @@ fn current_worker() -> *mut Worker {
     CURRENT_WORKER.with(|w| w.get())
 }
 
-/// A green thread task
-struct Task {
-    context: Context,
-    #[allow(dead_code)]
-    stack: Vec<u8>, // Keep stack alive
-    finished: bool,
-}
-
-impl Task {
-    /// Create a new task with the given entry function
-    fn new<F>(f: F) -> Self
-    where
-        F: FnOnce() + 'static,
-    {
-        let mut stack = vec![0u8; STACK_SIZE];
-
-        // Stack grows downward, so we start at the top
-        let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
-
-        // Align stack to 16 bytes (required by ABI)
-        let stack_top = stack_top & !0xF;
-
-        // Box the closure and leak it to get a raw pointer
-        let f_ptr = Box::into_raw(Box::new(f));
-
-        let context = Context::new_for_task(stack_top, task_entry::<F> as usize, f_ptr as u64);
-
-        Task {
-            context,
-            stack,
-            finished: false,
-        }
-    }
-}
-
 /// Called when a task completes
 fn task_finished() {
     unsafe {
         let worker = current_worker();
-        if let Some(ref mut task) = (*worker).current_task {
-            task.finished = true;
-        }
+        (*worker)
+            .current_task
+            .as_mut()
+            .expect("task_finished called without current task")
+            .finished = true;
         (*worker).switch_to_scheduler();
     }
 }
@@ -83,12 +50,11 @@ extern "C" fn task_entry<F>()
 where
     F: FnOnce() + 'static,
 {
-    unsafe {
+    let f = unsafe {
         let f_ptr = get_closure_ptr();
-
-        let f = Box::from_raw(f_ptr as *mut F);
-        f();
-    }
+        Box::from_raw(f_ptr as *mut F)
+    };
+    f();
 
     task_finished();
 }
@@ -113,9 +79,11 @@ impl Worker {
     }
 
     unsafe fn switch_to_scheduler(&mut self) {
-        if let Some(ref mut task) = self.current_task {
-            context_switch(&mut task.context, &self.context);
-        }
+        let task = self
+            .current_task
+            .as_mut()
+            .expect("switch_to_scheduler called without current task");
+        context_switch(&mut task.context, &self.context);
     }
 }
 
@@ -132,7 +100,7 @@ fn worker_loop() {
             // Run the task
             (*worker).current_task = Some(task);
 
-            let task_ctx = &(*worker).current_task.as_ref().unwrap().context as *const Context;
+            let task_ctx = &(*worker).current_task.as_ref().unwrap().context;
             context_switch(&mut (*worker).context, task_ctx);
 
             // Task yielded or finished
@@ -155,9 +123,13 @@ pub fn go<F>(f: F)
 where
     F: FnOnce() + 'static,
 {
+    let (stack, stack_top) = prepare_stack();
+    let f_ptr = Box::into_raw(Box::new(f)) as u64;
+    let context = Context::new(stack_top, task_entry::<F> as usize, f_ptr);
+    let task = Task::new(context, stack);
+
     unsafe {
         let worker = current_worker();
-        let task = Task::new(f);
         (*worker).tasks.push_back(task);
     }
 }
