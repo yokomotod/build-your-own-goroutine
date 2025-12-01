@@ -34,7 +34,6 @@ fn global_queue() -> &'static Mutex<GlobalQueue> {
     GLOBAL_QUEUE.get_or_init(|| {
         Mutex::new(GlobalQueue {
             tasks: VecDeque::new(),
-            shutdown: false,
         })
     })
 }
@@ -77,8 +76,6 @@ where
 struct GlobalQueue {
     /// Queue of runnable tasks
     tasks: VecDeque<Task>,
-    /// Flag to signal shutdown
-    shutdown: bool,
 }
 
 /// Per-thread worker state
@@ -127,10 +124,6 @@ fn worker_loop(worker_id: usize) {
                 if let Some(task) = q.tasks.pop_front() {
                     task
                 } else {
-                    if q.shutdown {
-                        break;
-                    }
-                    q.shutdown = true;
                     break;
                 }
             };
