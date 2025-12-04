@@ -143,12 +143,11 @@ fn worker_loop(worker_id: usize) {
             context_switch(worker_ctx, task_ctx);
 
             // Task yielded or finished (borrow ends immediately)
-            if let Some(task) = worker.current_task.borrow_mut().take() {
-                if task.state != TaskState::Dead {
+            if let Some(task) = worker.current_task.borrow_mut().take()
+                && task.state != TaskState::Dead {
                     // Task yielded, put back to global queue
                     queue.lock().unwrap().tasks.push_back(task);
                 }
-            }
             // If finished, just drop it
         }
     });

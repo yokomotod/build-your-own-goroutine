@@ -73,8 +73,8 @@ impl NetPoller {
         let mut ready_tasks = Vec::new();
         let waiting = self.waiting_fds.lock().unwrap();
 
-        for i in 0..(n as usize) {
-            let fd = events[i].u64 as RawFd;
+        for event in events.iter().take(n as usize) {
+            let fd = event.u64 as RawFd;
             if let Some(&task_id) = waiting.get(&fd) {
                 ready_tasks.push(task_id);
             }

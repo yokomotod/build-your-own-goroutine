@@ -176,12 +176,11 @@ fn worker_loop(worker_id: usize) {
             context_switch(worker_ctx, task_ctx);
 
             // Task yielded or finished
-            if let Some(mut task) = worker.current_task.borrow_mut().take() {
-                if task.state != TaskState::Dead {
+            if let Some(mut task) = worker.current_task.borrow_mut().take()
+                && task.state != TaskState::Dead {
                     task.state = TaskState::Runnable;
                     queue.lock().unwrap().tasks.push_back(task);
                 }
-            }
         }
     });
 
