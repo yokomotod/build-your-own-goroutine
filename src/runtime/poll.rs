@@ -2,13 +2,13 @@
 //!
 //! Extends the basic M:N runtime with:
 //! - gopark/goready for cooperative waiting
-//! - Network I/O polling with epoll
+//! - Network I/O polling with epoll (Linux) or kqueue (macOS/BSD)
 //! - Workers that sleep when idle (instead of terminating)
 
 use crate::common::{Context, Task, context_switch, get_closure_ptr, prepare_stack};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
@@ -22,6 +22,14 @@ impl TaskId {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    fn from_u64(id: u64) -> Self {
+        TaskId(id)
     }
 }
 
@@ -495,97 +503,16 @@ pub fn start_runtime(num_threads: usize) {
 }
 
 // ============================================================================
-// Network Poller (epoll-based)
+// Network Poller
 // ============================================================================
 
-/// Network poller using epoll
-struct NetworkPoller {
-    epoll_fd: RawFd,
-    /// Map from fd to waiting TaskId
-    waiting_fds: Mutex<HashMap<RawFd, TaskId>>,
-}
-
-/// Global network poller
-static NETWORK_POLLER: OnceLock<NetworkPoller> = OnceLock::new();
+use crate::netpoll;
 
 /// Flag to indicate if a worker is currently polling
 static POLLING: AtomicBool = AtomicBool::new(false);
 
-fn network_poller() -> &'static NetworkPoller {
-    NETWORK_POLLER.get_or_init(|| {
-        let epoll_fd = unsafe { libc::epoll_create1(0) };
-        if epoll_fd < 0 {
-            panic!("epoll_create1 failed");
-        }
-        NetworkPoller {
-            epoll_fd,
-            waiting_fds: Mutex::new(HashMap::new()),
-        }
-    })
-}
-
-impl NetworkPoller {
-    /// Register an fd for read readiness, associated with a task
-    fn register_read(&self, fd: RawFd, task_id: TaskId) {
-        let mut event = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: fd as u64,
-        };
-
-        let ret = unsafe {
-            libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event)
-        };
-        if ret < 0 {
-            panic!("epoll_ctl ADD failed");
-        }
-
-        self.waiting_fds.lock().unwrap().insert(fd, task_id);
-    }
-
-    /// Unregister an fd
-    fn unregister(&self, fd: RawFd) {
-        unsafe {
-            libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
-        }
-        self.waiting_fds.lock().unwrap().remove(&fd);
-    }
-
-    /// Poll for ready fds with timeout (in milliseconds)
-    /// Returns list of ready TaskIds
-    fn poll(&self, timeout_ms: i32) -> Vec<TaskId> {
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
-
-        let n = unsafe {
-            libc::epoll_wait(
-                self.epoll_fd,
-                events.as_mut_ptr(),
-                events.len() as i32,
-                timeout_ms,
-            )
-        };
-
-        if n < 0 {
-            // EINTR is ok, just return empty
-            return Vec::new();
-        }
-
-        let mut ready_tasks = Vec::new();
-        let waiting = self.waiting_fds.lock().unwrap();
-
-        for i in 0..(n as usize) {
-            let fd = events[i].u64 as RawFd;
-            if let Some(&task_id) = waiting.get(&fd) {
-                ready_tasks.push(task_id);
-            }
-        }
-
-        ready_tasks
-    }
-
-    /// Check if there are any fds being waited on
-    fn has_waiters(&self) -> bool {
-        !self.waiting_fds.lock().unwrap().is_empty()
-    }
+fn network_poller() -> &'static netpoll::NetPoller {
+    netpoll::net_poller()
 }
 
 /// Wait for an fd to become readable
@@ -597,7 +524,7 @@ pub fn net_poll_read<T: AsRawFd>(fd: &T) {
     let poller = network_poller();
 
     // Register for read readiness
-    poller.register_read(raw_fd, task_id);
+    poller.register_read(raw_fd, task_id.as_u64());
 
     // Park until ready
     gopark();
@@ -630,7 +557,7 @@ fn try_poll_network() -> bool {
 
     // Wake up ready tasks
     for task_id in ready_tasks {
-        goready(task_id);
+        goready(TaskId::from_u64(task_id));
     }
 
     true
