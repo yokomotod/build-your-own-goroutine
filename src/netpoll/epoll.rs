@@ -35,9 +35,7 @@ impl NetPoller {
             u64: fd as u64,
         };
 
-        let ret = unsafe {
-            libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event)
-        };
+        let ret = unsafe { libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) };
         if ret < 0 {
             panic!("epoll_ctl ADD failed");
         }

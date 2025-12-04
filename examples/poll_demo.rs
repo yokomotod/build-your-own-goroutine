@@ -15,7 +15,10 @@ const NUM_TASKS: usize = 32;
 
 fn main() {
     println!("=== mn_poll Network I/O Demo ===");
-    println!("Running {} tasks with network I/O on {} workers\n", NUM_TASKS, NUM_THREADS);
+    println!(
+        "Running {} tasks with network I/O on {} workers\n",
+        NUM_TASKS, NUM_THREADS
+    );
 
     // Start a simple echo server in a separate thread
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

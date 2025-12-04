@@ -5,7 +5,9 @@
 //! - Network I/O polling with epoll (Linux) or kqueue (macOS/BSD)
 //! - Workers that sleep when idle (instead of terminating)
 
-use crate::common::{Context, Task, TaskId, TaskState, context_switch, get_closure_ptr, prepare_stack};
+use crate::common::{
+    Context, Task, TaskId, TaskState, context_switch, get_closure_ptr, prepare_stack,
+};
 use crate::netpoll;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
@@ -235,7 +237,9 @@ pub fn gopark() {
     CURRENT_WORKER.with(|worker| {
         {
             let mut current = worker.current_task.borrow_mut();
-            let task = current.as_mut().expect("gopark called without current task");
+            let task = current
+                .as_mut()
+                .expect("gopark called without current task");
             task.state = TaskState::Waiting;
         }
 
@@ -494,7 +498,10 @@ pub fn net_poll_read<T: AsRawFd>(fd: &T) {
 /// Returns true if we did polling, false if another worker is already polling
 fn try_poll_network() -> bool {
     // Try to become the poller (only one worker can poll at a time)
-    if POLLING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    if POLLING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
         return false;
     }
 

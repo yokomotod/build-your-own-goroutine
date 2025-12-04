@@ -48,5 +48,8 @@ fn main() {
         NUM_THREADS,
         SLEEP_MS
     );
-    println!("With gosleep: ~{}ms (all tasks sleep concurrently)", SLEEP_MS);
+    println!(
+        "With gosleep: ~{}ms (all tasks sleep concurrently)",
+        SLEEP_MS
+    );
 }

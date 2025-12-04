@@ -28,7 +28,10 @@ fn main() {
     println!("1 task: {:?}\n", baseline);
 
     // Main test: 8 tasks
-    println!("--- Main: {} tasks with {} initial workers ---", NUM_TASKS, NUM_THREADS);
+    println!(
+        "--- Main: {} tasks with {} initial workers ---",
+        NUM_TASKS, NUM_THREADS
+    );
     let start = Instant::now();
     for _ in 0..NUM_TASKS {
         go(read_urandom);
@@ -37,5 +40,8 @@ fn main() {
     let elapsed = start.elapsed();
 
     println!("\n{} tasks: {:?}", NUM_TASKS, elapsed);
-    println!("Speedup: {:.2}x vs sequential", (baseline.as_secs_f64() * NUM_TASKS as f64) / elapsed.as_secs_f64());
+    println!(
+        "Speedup: {:.2}x vs sequential",
+        (baseline.as_secs_f64() * NUM_TASKS as f64) / elapsed.as_secs_f64()
+    );
 }
