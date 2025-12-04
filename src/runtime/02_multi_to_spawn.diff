@@ -1,0 +1,170 @@
+--- src/runtime/multi.rs	2025-12-04 20:45:26.379711321 +0900
++++ src/runtime/spawn.rs	2025-12-04 22:45:37.598484430 +0900
+@@ -1,24 +1,8 @@
+-//! M:N Green Thread Runtime
++//! M:N Green Thread Runtime with Dynamic Worker Spawning
+ //!
+-//! # Example
+-//!
+-//! ```no_run
+-//! use mygoroutine::mn::{go, start_runtime, gosched};
+-//!
+-//! const NUM_THREADS: usize = 4;
+-//!
+-//! go(|| {
+-//!     println!("Task 1");
+-//!     gosched();
+-//!     println!("Task 1 done");
+-//! });
+-//!
+-//! go(|| {
+-//!     println!("Task 2");
+-//! });
+-//!
+-//! start_runtime(NUM_THREADS);
+-//! ```
++//! Extends the basic M:N runtime with blocking I/O support.
++//! When a task enters a blocking operation (like file I/O),
++//! the runtime spawns a new worker to keep other tasks running.
+ 
+ use crate::common::{
+     Context, Task, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
+@@ -35,6 +19,7 @@
+     GLOBAL_QUEUE.get_or_init(|| {
+         Mutex::new(GlobalQueue {
+             tasks: VecDeque::new(),
++            next_worker_id: 0,
+         })
+     })
+ }
+@@ -77,6 +62,8 @@
+ struct GlobalQueue {
+     /// Queue of runnable tasks
+     tasks: VecDeque<Task>,
++    /// Next worker ID to assign
++    next_worker_id: usize,
+ }
+ 
+ fn worker_loop(worker_id: usize) {
+@@ -123,6 +110,21 @@
+     println!("[Worker {}] Shutting down", worker_id);
+ }
+ 
++/// Spawn a new worker thread
++fn spawn_worker() {
++    let queue = global_queue();
++    let worker_id = {
++        let mut q = queue.lock().unwrap();
++        let id = q.next_worker_id;
++        q.next_worker_id += 1;
++        id
++    };
++
++    thread::spawn(move || {
++        worker_loop(worker_id);
++    });
++}
++
+ /// Spawn a new green thread
+ ///
+ /// Can be called either before `start_runtime()` to register initial tasks,
+@@ -151,6 +153,12 @@
+ /// # Warning
+ /// Do not call this from within a running task.
+ pub fn start_runtime(num_threads: usize) {
++    // Set initial worker IDs
++    {
++        let mut q = global_queue().lock().unwrap();
++        q.next_worker_id = num_threads;
++    }
++
+     let mut handles = Vec::new();
+ 
+     for worker_id in 0..num_threads {
+@@ -160,7 +168,86 @@
+         handles.push(handle);
+     }
+ 
++    // Wait for initial workers
++    // Note: dynamically spawned workers are detached (not joined)
+     for handle in handles {
+         handle.join().unwrap();
+     }
+ }
++
++// ============================================================================
++// Blocking I/O Support
++// ============================================================================
++
++/// Internal: called before entering a blocking operation.
++/// Spawns a new worker if needed (like Go 1.0's entersyscall).
++fn enter_blocking() {
++    let queue = global_queue();
++
++    let should_spawn = {
++        let q = queue.lock().unwrap();
++        !q.tasks.is_empty()
++    };
++
++    if should_spawn {
++        spawn_worker();
++    }
++}
++
++/// I/O module providing blocking-aware wrappers.
++pub mod io {
++    use super::enter_blocking;
++    use std::fs::File;
++    use std::io::{self, Read, Write};
++    use std::path::Path;
++
++    pub fn read<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
++        enter_blocking();
++        reader.read(buf)
++    }
++
++    pub fn read_to_end<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<usize> {
++        enter_blocking();
++        reader.read_to_end(buf)
++    }
++
++    pub fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
++        enter_blocking();
++        reader.read_exact(buf)
++    }
++
++    pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
++        enter_blocking();
++        std::fs::read(path)
++    }
++
++    pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
++        enter_blocking();
++        std::fs::read_to_string(path)
++    }
++
++    pub fn write<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<usize> {
++        enter_blocking();
++        writer.write(buf)
++    }
++
++    pub fn write_all<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<()> {
++        enter_blocking();
++        writer.write_all(buf)
++    }
++
++    pub fn write_file<P: AsRef<Path>>(path: P, contents: &[u8]) -> io::Result<()> {
++        enter_blocking();
++        std::fs::write(path, contents)
++    }
++
++    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
++        enter_blocking();
++        File::open(path)
++    }
++
++    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
++        enter_blocking();
++        File::create(path)
++    }
++}

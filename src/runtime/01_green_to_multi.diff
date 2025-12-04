@@ -1,0 +1,176 @@
+--- src/runtime/green.rs	2025-12-04 20:47:26.431266407 +0900
++++ src/runtime/multi.rs	2025-12-04 20:45:26.379711321 +0900
+@@ -1,9 +1,11 @@
+-//! N:1 Green Thread Runtime
++//! M:N Green Thread Runtime
+ //!
+ //! # Example
+ //!
+ //! ```no_run
+-//! use mygoroutine::n1::{go, start_runtime, gosched};
++//! use mygoroutine::mn::{go, start_runtime, gosched};
++//!
++//! const NUM_THREADS: usize = 4;
+ //!
+ //! go(|| {
+ //!     println!("Task 1");
+@@ -15,12 +17,27 @@
+ //!     println!("Task 2");
+ //! });
+ //!
+-//! start_runtime();
++//! start_runtime(NUM_THREADS);
+ //! ```
+ 
+-use crate::common::{Context, Task, TaskState, context_switch, get_closure_ptr, prepare_stack};
+-use std::cell::{RefCell, UnsafeCell};
++use crate::common::{
++    Context, Task, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
++};
+ use std::collections::VecDeque;
++use std::sync::{Mutex, OnceLock};
++use std::thread;
++
++/// Global task queue
++static GLOBAL_QUEUE: OnceLock<Mutex<GlobalQueue>> = OnceLock::new();
++
++/// Get or initialize the global queue
++fn global_queue() -> &'static Mutex<GlobalQueue> {
++    GLOBAL_QUEUE.get_or_init(|| {
++        Mutex::new(GlobalQueue {
++            tasks: VecDeque::new(),
++        })
++    })
++}
+ 
+ thread_local! {
+     static CURRENT_WORKER: Worker = Worker::new();
+@@ -45,7 +62,7 @@
+ /// The closure pointer is passed via a callee-saved register.
+ extern "C" fn task_entry<F>()
+ where
+-    F: FnOnce() + 'static,
++    F: FnOnce() + Send + 'static,
+ {
+     let f = unsafe {
+         let f_ptr = get_closure_ptr();
+@@ -56,49 +73,26 @@
+     task_finished();
+ }
+ 
+-/// N:1 Green Thread Worker (internal)
+-struct Worker {
++/// Global task queue shared by all workers
++struct GlobalQueue {
+     /// Queue of runnable tasks
+-    tasks: RefCell<VecDeque<Task>>,
+-    /// Context to return to when a task yields
+-    context: UnsafeCell<Context>,
+-    /// Currently running task
+-    current_task: RefCell<Option<Task>>,
++    tasks: VecDeque<Task>,
+ }
+ 
+-impl Worker {
+-    fn new() -> Self {
+-        Worker {
+-            tasks: RefCell::new(VecDeque::new()),
+-            context: UnsafeCell::new(Context::default()),
+-            current_task: RefCell::new(None),
+-        }
+-    }
+-
+-    fn switch_to_scheduler(&self) {
+-        // Get pointers before context_switch (to avoid holding RefCell borrow across switch)
+-        let task_ctx: *mut Context = {
+-            let mut task = self.current_task.borrow_mut();
+-            &mut task
+-                .as_mut()
+-                .expect("switch_to_scheduler called without current task")
+-                .context as *mut Context
+-        }; // RefMut is dropped here
+-
+-        let worker_ctx: *const Context = self.context.get();
+-
+-        // Note: We use raw pointers because context_switch requires simultaneous
+-        // access to two Contexts, which Rust's borrow checker cannot express.
+-        context_switch(task_ctx, worker_ctx);
+-    }
+-}
++fn worker_loop(worker_id: usize) {
++    let queue = global_queue();
+ 
+-fn worker_loop() {
+     CURRENT_WORKER.with(|worker| {
+         loop {
+-            // Get task from queue (borrow ends immediately)
+-            let Some(task) = worker.tasks.borrow_mut().pop_front() else {
+-                break;
++            // Get task from global queue
++            let task = {
++                let mut q = queue.lock().unwrap();
++
++                if let Some(task) = q.tasks.pop_front() {
++                    task
++                } else {
++                    break;
++                }
+             };
+ 
+             // Set current task (borrow ends immediately)
+@@ -119,12 +113,14 @@
+             if let Some(task) = worker.current_task.borrow_mut().take()
+                 && task.state != TaskState::Dead
+             {
+-                // Task yielded, put back to queue
+-                worker.tasks.borrow_mut().push_back(task);
++                // Task yielded, put back to global queue
++                queue.lock().unwrap().tasks.push_back(task);
+             }
+             // If finished, just drop it
+         }
+     });
++
++    println!("[Worker {}] Shutting down", worker_id);
+ }
+ 
+ /// Spawn a new green thread
+@@ -133,16 +129,14 @@
+ /// or from within a running task to spawn child tasks.
+ pub fn go<F>(f: F)
+ where
+-    F: FnOnce() + 'static,
++    F: FnOnce() + Send + 'static,
+ {
+     let (stack, stack_top) = prepare_stack();
+     let f_ptr = Box::into_raw(Box::new(f)) as u64;
+     let context = Context::new(stack_top, task_entry::<F> as usize, f_ptr);
+     let task = Task::new(context, stack);
+ 
+-    CURRENT_WORKER.with(|worker| {
+-        worker.tasks.borrow_mut().push_back(task);
+-    });
++    global_queue().lock().unwrap().tasks.push_back(task);
+ }
+ 
+ /// Yield execution to another green thread
+@@ -156,6 +150,17 @@
+ ///
+ /// # Warning
+ /// Do not call this from within a running task.
+-pub fn start_runtime() {
+-    worker_loop();
++pub fn start_runtime(num_threads: usize) {
++    let mut handles = Vec::new();
++
++    for worker_id in 0..num_threads {
++        let handle = thread::spawn(move || {
++            worker_loop(worker_id);
++        });
++        handles.push(handle);
++    }
++
++    for handle in handles {
++        handle.join().unwrap();
++    }
+ }

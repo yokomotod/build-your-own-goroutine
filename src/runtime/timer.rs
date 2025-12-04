@@ -57,6 +57,8 @@ fn task_finished() {
 }
 
 /// Entry point for new tasks
+///
+/// The closure pointer is passed via a callee-saved register.
 extern "C" fn task_entry<F>()
 where
     F: FnOnce() + Send + 'static,
@@ -175,7 +177,7 @@ fn worker_loop(worker_id: usize) {
                 continue;
             };
 
-            // Set current task
+            // Set current task (borrow ends immediately)
             *worker.current_task.borrow_mut() = Some(task);
 
             // Get pointers before context_switch
@@ -183,11 +185,13 @@ fn worker_loop(worker_id: usize) {
             let task_ctx: *const Context = {
                 let task = worker.current_task.borrow();
                 &task.as_ref().unwrap().context as *const Context
-            };
+            }; // Ref is dropped here
 
+            // Note: We use raw pointers because context_switch requires simultaneous
+            // access to two Contexts, which Rust's borrow checker cannot express.
             context_switch(worker_ctx, task_ctx);
 
-            // Task yielded or finished
+            // Task yielded or finished (borrow ends immediately)
             if let Some(mut task) = worker.current_task.borrow_mut().take() {
                 match task.state {
                     TaskState::Dead => {
@@ -276,7 +280,25 @@ pub fn current_task_id() -> TaskId {
     })
 }
 
+/// Spawn a new worker thread
+fn spawn_worker() {
+    let queue = global_queue();
+    let worker_id = {
+        let mut q = queue.lock().unwrap();
+        let id = q.next_worker_id;
+        q.next_worker_id += 1;
+        id
+    };
+
+    thread::spawn(move || {
+        worker_loop(worker_id);
+    });
+}
+
 /// Spawn a new green thread
+///
+/// Can be called either before `start_runtime()` to register initial tasks,
+/// or from within a running task to spawn child tasks.
 pub fn go<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
@@ -298,140 +320,6 @@ where
     }
 }
 
-// ============================================================================
-// Blocking I/O Support (File I/O etc.)
-// ============================================================================
-
-/// Internal: called before entering a blocking operation.
-/// Like Go 1.0's entersyscall.
-fn enter_blocking() {
-    let queue = global_queue();
-
-    let should_spawn = {
-        let q = queue.lock().unwrap();
-        // Spawn a new worker if:
-        // - There are runnable tasks waiting
-        // - No idle workers to pick them up
-        !q.runnable.is_empty() && q.idle_workers == 0
-    };
-
-    if should_spawn {
-        spawn_worker();
-    }
-}
-
-/// Internal: called after returning from a blocking operation.
-fn exit_blocking() {
-    // No-op for now
-}
-
-/// I/O module providing blocking-aware wrappers.
-///
-/// Use these functions instead of std::io/std::fs when running inside
-/// the mn_poll runtime. They notify the runtime before blocking,
-/// allowing other tasks to continue running.
-pub mod io {
-    use super::{enter_blocking, exit_blocking};
-    use std::fs::File;
-    use std::io::{self, Read, Write};
-    use std::path::Path;
-
-    /// Read from a reader (blocking-aware wrapper for Read::read)
-    pub fn read<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
-        enter_blocking();
-        let result = reader.read(buf);
-        exit_blocking();
-        result
-    }
-
-    /// Read all bytes from a reader (blocking-aware wrapper for Read::read_to_end)
-    pub fn read_to_end<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<usize> {
-        enter_blocking();
-        let result = reader.read_to_end(buf);
-        exit_blocking();
-        result
-    }
-
-    /// Read exact number of bytes (blocking-aware wrapper for Read::read_exact)
-    pub fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
-        enter_blocking();
-        let result = reader.read_exact(buf);
-        exit_blocking();
-        result
-    }
-
-    /// Read entire file contents as bytes
-    pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-        enter_blocking();
-        let result = std::fs::read(path);
-        exit_blocking();
-        result
-    }
-
-    /// Read entire file contents as string
-    pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
-        enter_blocking();
-        let result = std::fs::read_to_string(path);
-        exit_blocking();
-        result
-    }
-
-    /// Write to a writer (blocking-aware wrapper for Write::write)
-    pub fn write<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<usize> {
-        enter_blocking();
-        let result = writer.write(buf);
-        exit_blocking();
-        result
-    }
-
-    /// Write all bytes to a writer (blocking-aware wrapper for Write::write_all)
-    pub fn write_all<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<()> {
-        enter_blocking();
-        let result = writer.write_all(buf);
-        exit_blocking();
-        result
-    }
-
-    /// Write bytes to a file
-    pub fn write_file<P: AsRef<Path>>(path: P, contents: &[u8]) -> io::Result<()> {
-        enter_blocking();
-        let result = std::fs::write(path, contents);
-        exit_blocking();
-        result
-    }
-
-    /// Open a file
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
-        enter_blocking();
-        let result = File::open(path);
-        exit_blocking();
-        result
-    }
-
-    /// Create a file
-    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
-        enter_blocking();
-        let result = File::create(path);
-        exit_blocking();
-        result
-    }
-}
-
-/// Spawn a new worker thread
-fn spawn_worker() {
-    let queue = global_queue();
-    let worker_id = {
-        let mut q = queue.lock().unwrap();
-        let id = q.next_worker_id;
-        q.next_worker_id += 1;
-        id
-    };
-
-    thread::spawn(move || {
-        worker_loop(worker_id);
-    });
-}
-
 /// Yield execution to another green thread
 pub fn gosched() {
     CURRENT_WORKER.with(|worker| {
@@ -440,6 +328,9 @@ pub fn gosched() {
 }
 
 /// Start the runtime and run until all tasks complete
+///
+/// # Warning
+/// Do not call this from within a running task.
 pub fn start_runtime(num_threads: usize) {
     // Set initial worker IDs
     {
@@ -460,6 +351,86 @@ pub fn start_runtime(num_threads: usize) {
     // Note: dynamically spawned workers are detached (not joined)
     for handle in handles {
         handle.join().unwrap();
+    }
+}
+
+// ============================================================================
+// Blocking I/O Support
+// ============================================================================
+
+/// Internal: called before entering a blocking operation.
+/// Spawns a new worker if needed (like Go 1.0's entersyscall).
+fn enter_blocking() {
+    let queue = global_queue();
+
+    let should_spawn = {
+        let q = queue.lock().unwrap();
+        // Spawn a new worker if:
+        // - There are runnable tasks waiting
+        // - No idle workers to pick them up
+        !q.runnable.is_empty() && q.idle_workers == 0
+    };
+
+    if should_spawn {
+        spawn_worker();
+    }
+}
+
+/// I/O module providing blocking-aware wrappers.
+pub mod io {
+    use super::enter_blocking;
+    use std::fs::File;
+    use std::io::{self, Read, Write};
+    use std::path::Path;
+
+    pub fn read<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+        enter_blocking();
+        reader.read(buf)
+    }
+
+    pub fn read_to_end<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<usize> {
+        enter_blocking();
+        reader.read_to_end(buf)
+    }
+
+    pub fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
+        enter_blocking();
+        reader.read_exact(buf)
+    }
+
+    pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+        enter_blocking();
+        std::fs::read(path)
+    }
+
+    pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
+        enter_blocking();
+        std::fs::read_to_string(path)
+    }
+
+    pub fn write<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<usize> {
+        enter_blocking();
+        writer.write(buf)
+    }
+
+    pub fn write_all<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<()> {
+        enter_blocking();
+        writer.write_all(buf)
+    }
+
+    pub fn write_file<P: AsRef<Path>>(path: P, contents: &[u8]) -> io::Result<()> {
+        enter_blocking();
+        std::fs::write(path, contents)
+    }
+
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
+        enter_blocking();
+        File::open(path)
+    }
+
+    pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
+        enter_blocking();
+        File::create(path)
     }
 }
 

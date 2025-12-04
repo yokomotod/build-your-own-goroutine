@@ -1,0 +1,333 @@
+--- src/runtime/spawn.rs	2025-12-04 22:45:37.598484430 +0900
++++ src/runtime/poll.rs	2025-12-04 22:37:04.168568697 +0900
+@@ -1,14 +1,18 @@
+-//! M:N Green Thread Runtime with Dynamic Worker Spawning
++//! M:N Green Thread Runtime with Network Polling
+ //!
+-//! Extends the basic M:N runtime with blocking I/O support.
+-//! When a task enters a blocking operation (like file I/O),
+-//! the runtime spawns a new worker to keep other tasks running.
++//! Extends the basic M:N runtime with:
++//! - gopark/goready for cooperative waiting
++//! - Network I/O polling with epoll (Linux) or kqueue (macOS/BSD)
++//! - Workers that sleep when idle (instead of terminating)
+ 
+ use crate::common::{
+-    Context, Task, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
++    Context, Task, TaskId, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
+ };
+-use std::collections::VecDeque;
+-use std::sync::{Mutex, OnceLock};
++use crate::netpoll;
++use std::collections::{HashMap, VecDeque};
++use std::os::fd::AsRawFd;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Condvar, Mutex, OnceLock};
+ use std::thread;
+ 
+ /// Global task queue
+@@ -18,12 +22,22 @@
+ fn global_queue() -> &'static Mutex<GlobalQueue> {
+     GLOBAL_QUEUE.get_or_init(|| {
+         Mutex::new(GlobalQueue {
+-            tasks: VecDeque::new(),
++            runnable: VecDeque::new(),
++            waiting: HashMap::new(),
++            idle_workers: 0,
++            all_workers: 0,
+             next_worker_id: 0,
+         })
+     })
+ }
+ 
++/// Condition variable for worker wakeup
++static WORKER_CONDVAR: OnceLock<Condvar> = OnceLock::new();
++
++fn worker_condvar() -> &'static Condvar {
++    WORKER_CONDVAR.get_or_init(Condvar::new)
++}
++
+ thread_local! {
+     static CURRENT_WORKER: Worker = Worker::new();
+ }
+@@ -61,13 +75,38 @@
+ /// Global task queue shared by all workers
+ struct GlobalQueue {
+     /// Queue of runnable tasks
+-    tasks: VecDeque<Task>,
++    runnable: VecDeque<Task>,
++    /// Tasks waiting for I/O or other events
++    waiting: HashMap<TaskId, Task>,
++    /// Number of idle workers (waiting on condvar)
++    idle_workers: usize,
++    /// Total number of workers
++    all_workers: usize,
+     /// Next worker ID to assign
+     next_worker_id: usize,
+ }
+ 
++/// Check if the runtime should terminate
++fn should_terminate(queue: &GlobalQueue) -> bool {
++    // Terminate when:
++    // - No runnable tasks
++    // - No waiting tasks (including network waiters)
++    // - All workers are idle (except us, who is checking)
++    queue.runnable.is_empty()
++        && queue.waiting.is_empty()
++        && !network_poller().has_waiters()
++        && queue.idle_workers == queue.all_workers - 1
++}
++
+ fn worker_loop(worker_id: usize) {
+     let queue = global_queue();
++    let condvar = worker_condvar();
++
++    // Register this worker
++    {
++        let mut q = queue.lock().unwrap();
++        q.all_workers += 1;
++    }
+ 
+     CURRENT_WORKER.with(|worker| {
+         loop {
+@@ -75,13 +114,57 @@
+             let task = {
+                 let mut q = queue.lock().unwrap();
+ 
+-                if let Some(task) = q.tasks.pop_front() {
+-                    task
++                if let Some(mut task) = q.runnable.pop_front() {
++                    task.state = TaskState::Running;
++                    Some(task)
+                 } else {
+-                    break;
++                    // No runnable tasks - check for termination
++                    if should_terminate(&q) {
++                        // Wake up all other workers so they can also terminate
++                        condvar.notify_all();
++                        q.all_workers -= 1;
++                        return; // Exit the closure, ending the loop
++                    }
++
++                    // Drop lock before polling (polling may block)
++                    drop(q);
++
++                    // Try to become the poller
++                    if try_poll_network() {
++                        // We did some polling, there might be work now
++                        // Loop back to check runnable queue
++                        None
++                    } else {
++                        // Another worker is polling, or no network waiters
++                        // Go idle and wait for work
++                        let mut q = queue.lock().unwrap();
++                        q.idle_workers += 1;
++                        let mut q = condvar.wait(q).unwrap();
++                        q.idle_workers -= 1;
++
++                        // After wakeup, check termination again
++                        if should_terminate(&q) {
++                            condvar.notify_all();
++                            q.all_workers -= 1;
++                            return;
++                        }
++
++                        // Try to get a task
++                        if let Some(mut task) = q.runnable.pop_front() {
++                            task.state = TaskState::Running;
++                            Some(task)
++                        } else {
++                            None
++                        }
++                    }
+                 }
+             };
+ 
++            let Some(task) = task else {
++                // Spurious wakeup, loop again
++                continue;
++            };
++
+             // Set current task (borrow ends immediately)
+             *worker.current_task.borrow_mut() = Some(task);
+ 
+@@ -97,19 +180,77 @@
+             context_switch(worker_ctx, task_ctx);
+ 
+             // Task yielded or finished (borrow ends immediately)
+-            if let Some(task) = worker.current_task.borrow_mut().take()
+-                && task.state != TaskState::Dead
+-            {
+-                // Task yielded, put back to global queue
+-                queue.lock().unwrap().tasks.push_back(task);
++            if let Some(mut task) = worker.current_task.borrow_mut().take() {
++                match task.state {
++                    TaskState::Dead => {
++                        // Task finished, drop it
++                    }
++                    TaskState::Waiting => {
++                        // gopark was called - move task to waiting map
++                        let mut q = queue.lock().unwrap();
++                        q.waiting.insert(task.id, task);
++                    }
++                    _ => {
++                        // Normal yield (gosched), put back to runnable queue
++                        task.state = TaskState::Runnable;
++                        queue.lock().unwrap().runnable.push_back(task);
++                    }
++                }
+             }
+-            // If finished, just drop it
+         }
+     });
+ 
+     println!("[Worker {}] Shutting down", worker_id);
+ }
+ 
++/// Park the current task (move to waiting state)
++///
++/// The task will be woken up by calling `goready(task_id)`.
++pub fn gopark() {
++    CURRENT_WORKER.with(|worker| {
++        {
++            let mut current = worker.current_task.borrow_mut();
++            let task = current
++                .as_mut()
++                .expect("gopark called without current task");
++            task.state = TaskState::Waiting;
++        }
++
++        // Switch to scheduler - it will move this task to waiting map
++        worker.switch_to_scheduler();
++    })
++}
++
++/// Wake up a parked task (move back to runnable state)
++pub fn goready(task_id: TaskId) {
++    let queue = global_queue();
++    let condvar = worker_condvar();
++
++    let mut q = queue.lock().unwrap();
++
++    if let Some(mut task) = q.waiting.remove(&task_id) {
++        task.state = TaskState::Runnable;
++        q.runnable.push_back(task);
++
++        // Wake up an idle worker if any
++        if q.idle_workers > 0 {
++            condvar.notify_one();
++        }
++    }
++}
++
++/// Get the current task's ID
++pub fn current_task_id() -> TaskId {
++    CURRENT_WORKER.with(|worker| {
++        worker
++            .current_task
++            .borrow()
++            .as_ref()
++            .expect("current_task_id called outside of task")
++            .id
++    })
++}
++
+ /// Spawn a new worker thread
+ fn spawn_worker() {
+     let queue = global_queue();
+@@ -138,7 +279,16 @@
+     let context = Context::new(stack_top, task_entry::<F> as usize, f_ptr);
+     let task = Task::new(context, stack);
+ 
+-    global_queue().lock().unwrap().tasks.push_back(task);
++    let queue = global_queue();
++    let condvar = worker_condvar();
++
++    let mut q = queue.lock().unwrap();
++    q.runnable.push_back(task);
++
++    // Wake up an idle worker if any
++    if q.idle_workers > 0 {
++        condvar.notify_one();
++    }
+ }
+ 
+ /// Yield execution to another green thread
+@@ -186,7 +336,10 @@
+ 
+     let should_spawn = {
+         let q = queue.lock().unwrap();
+-        !q.tasks.is_empty()
++        // Spawn a new worker if:
++        // - There are runnable tasks waiting
++        // - No idle workers to pick them up
++        !q.runnable.is_empty() && q.idle_workers == 0
+     };
+ 
+     if should_spawn {
+@@ -251,3 +404,65 @@
+         File::create(path)
+     }
+ }
++
++// ============================================================================
++// Network Poller
++// ============================================================================
++
++/// Flag to indicate if a worker is currently polling
++static POLLING: AtomicBool = AtomicBool::new(false);
++
++fn network_poller() -> &'static netpoll::NetPoller {
++    netpoll::net_poller()
++}
++
++/// Wait for an fd to become readable
++///
++/// Parks the current task until the fd is ready for reading.
++pub fn net_poll_read<T: AsRawFd>(fd: &T) {
++    let raw_fd = fd.as_raw_fd();
++    let task_id = current_task_id();
++    let poller = network_poller();
++
++    // Register for read readiness
++    poller.register_read(raw_fd, task_id.as_u64());
++
++    // Park until ready
++    gopark();
++
++    // Unregister after wakeup
++    poller.unregister(raw_fd);
++}
++
++/// Try to become the poller and poll for network events
++/// Returns true if we did polling, false if another worker is already polling
++fn try_poll_network() -> bool {
++    // Try to become the poller (only one worker can poll at a time)
++    if POLLING
++        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
++        .is_err()
++    {
++        return false;
++    }
++
++    let poller = network_poller();
++
++    // Only poll if there are waiters
++    if !poller.has_waiters() {
++        POLLING.store(false, Ordering::Release);
++        return false;
++    }
++
++    // Poll with a timeout (100ms) to avoid blocking forever
++    let ready_tasks = poller.poll(100);
++
++    // Release polling flag before waking tasks
++    POLLING.store(false, Ordering::Release);
++
++    // Wake up ready tasks
++    for task_id in ready_tasks {
++        goready(TaskId::from_u64(task_id));
++    }
++
++    true
++}

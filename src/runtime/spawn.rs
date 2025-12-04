@@ -8,7 +8,7 @@ use crate::common::{
     Context, Task, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
 };
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 /// Global task queue
@@ -19,18 +19,9 @@ fn global_queue() -> &'static Mutex<GlobalQueue> {
     GLOBAL_QUEUE.get_or_init(|| {
         Mutex::new(GlobalQueue {
             tasks: VecDeque::new(),
-            idle_workers: 0,
-            all_workers: 0,
             next_worker_id: 0,
         })
     })
-}
-
-/// Condition variable for worker wakeup
-static WORKER_CONDVAR: OnceLock<Condvar> = OnceLock::new();
-
-fn worker_condvar() -> &'static Condvar {
-    WORKER_CONDVAR.get_or_init(Condvar::new)
 }
 
 thread_local! {
@@ -52,6 +43,8 @@ fn task_finished() {
 }
 
 /// Entry point for new tasks
+///
+/// The closure pointer is passed via a callee-saved register.
 extern "C" fn task_entry<F>()
 where
     F: FnOnce() + Send + 'static,
@@ -69,28 +62,12 @@ where
 struct GlobalQueue {
     /// Queue of runnable tasks
     tasks: VecDeque<Task>,
-    /// Number of idle workers (waiting on condvar)
-    idle_workers: usize,
-    /// Total number of workers
-    all_workers: usize,
     /// Next worker ID to assign
     next_worker_id: usize,
 }
 
-/// Check if the runtime should terminate
-fn should_terminate(queue: &GlobalQueue) -> bool {
-    queue.tasks.is_empty() && queue.idle_workers == queue.all_workers - 1
-}
-
 fn worker_loop(worker_id: usize) {
     let queue = global_queue();
-    let condvar = worker_condvar();
-
-    // Register this worker
-    {
-        let mut q = queue.lock().unwrap();
-        q.all_workers += 1;
-    }
 
     CURRENT_WORKER.with(|worker| {
         loop {
@@ -98,43 +75,14 @@ fn worker_loop(worker_id: usize) {
             let task = {
                 let mut q = queue.lock().unwrap();
 
-                if let Some(mut task) = q.tasks.pop_front() {
-                    task.state = TaskState::Running;
-                    Some(task)
+                if let Some(task) = q.tasks.pop_front() {
+                    task
                 } else {
-                    // No runnable tasks - check for termination
-                    if should_terminate(&q) {
-                        condvar.notify_all();
-                        q.all_workers -= 1;
-                        return;
-                    }
-
-                    // Go idle and wait for work
-                    q.idle_workers += 1;
-                    let mut q = condvar.wait(q).unwrap();
-                    q.idle_workers -= 1;
-
-                    // After wakeup, check termination again
-                    if should_terminate(&q) {
-                        condvar.notify_all();
-                        q.all_workers -= 1;
-                        return;
-                    }
-
-                    if let Some(mut task) = q.tasks.pop_front() {
-                        task.state = TaskState::Running;
-                        Some(task)
-                    } else {
-                        None
-                    }
+                    break;
                 }
             };
 
-            let Some(task) = task else {
-                continue;
-            };
-
-            // Set current task
+            // Set current task (borrow ends immediately)
             *worker.current_task.borrow_mut() = Some(task);
 
             // Get pointers before context_switch
@@ -142,17 +90,20 @@ fn worker_loop(worker_id: usize) {
             let task_ctx: *const Context = {
                 let task = worker.current_task.borrow();
                 &task.as_ref().unwrap().context as *const Context
-            };
+            }; // Ref is dropped here
 
+            // Note: We use raw pointers because context_switch requires simultaneous
+            // access to two Contexts, which Rust's borrow checker cannot express.
             context_switch(worker_ctx, task_ctx);
 
-            // Task yielded or finished
-            if let Some(mut task) = worker.current_task.borrow_mut().take()
+            // Task yielded or finished (borrow ends immediately)
+            if let Some(task) = worker.current_task.borrow_mut().take()
                 && task.state != TaskState::Dead
             {
-                task.state = TaskState::Runnable;
+                // Task yielded, put back to global queue
                 queue.lock().unwrap().tasks.push_back(task);
             }
+            // If finished, just drop it
         }
     });
 
@@ -175,6 +126,9 @@ fn spawn_worker() {
 }
 
 /// Spawn a new green thread
+///
+/// Can be called either before `start_runtime()` to register initial tasks,
+/// or from within a running task to spawn child tasks.
 pub fn go<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
@@ -184,15 +138,7 @@ where
     let context = Context::new(stack_top, task_entry::<F> as usize, f_ptr);
     let task = Task::new(context, stack);
 
-    let queue = global_queue();
-    let condvar = worker_condvar();
-
-    let mut q = queue.lock().unwrap();
-    q.tasks.push_back(task);
-
-    if q.idle_workers > 0 {
-        condvar.notify_one();
-    }
+    global_queue().lock().unwrap().tasks.push_back(task);
 }
 
 /// Yield execution to another green thread
@@ -203,7 +149,11 @@ pub fn gosched() {
 }
 
 /// Start the runtime and run until all tasks complete
+///
+/// # Warning
+/// Do not call this from within a running task.
 pub fn start_runtime(num_threads: usize) {
+    // Set initial worker IDs
     {
         let mut q = global_queue().lock().unwrap();
         q.next_worker_id = num_threads;
@@ -218,6 +168,8 @@ pub fn start_runtime(num_threads: usize) {
         handles.push(handle);
     }
 
+    // Wait for initial workers
+    // Note: dynamically spawned workers are detached (not joined)
     for handle in handles {
         handle.join().unwrap();
     }
@@ -234,7 +186,7 @@ fn enter_blocking() {
 
     let should_spawn = {
         let q = queue.lock().unwrap();
-        !q.tasks.is_empty() && q.idle_workers == 0
+        !q.tasks.is_empty()
     };
 
     if should_spawn {
@@ -242,85 +194,60 @@ fn enter_blocking() {
     }
 }
 
-/// Internal: called after returning from a blocking operation.
-fn exit_blocking() {
-    // No-op for now
-}
-
 /// I/O module providing blocking-aware wrappers.
 pub mod io {
-    use super::{enter_blocking, exit_blocking};
+    use super::enter_blocking;
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::path::Path;
 
     pub fn read<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
         enter_blocking();
-        let result = reader.read(buf);
-        exit_blocking();
-        result
+        reader.read(buf)
     }
 
     pub fn read_to_end<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<usize> {
         enter_blocking();
-        let result = reader.read_to_end(buf);
-        exit_blocking();
-        result
+        reader.read_to_end(buf)
     }
 
     pub fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
         enter_blocking();
-        let result = reader.read_exact(buf);
-        exit_blocking();
-        result
+        reader.read_exact(buf)
     }
 
     pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
         enter_blocking();
-        let result = std::fs::read(path);
-        exit_blocking();
-        result
+        std::fs::read(path)
     }
 
     pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
         enter_blocking();
-        let result = std::fs::read_to_string(path);
-        exit_blocking();
-        result
+        std::fs::read_to_string(path)
     }
 
     pub fn write<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<usize> {
         enter_blocking();
-        let result = writer.write(buf);
-        exit_blocking();
-        result
+        writer.write(buf)
     }
 
     pub fn write_all<W: Write>(writer: &mut W, buf: &[u8]) -> io::Result<()> {
         enter_blocking();
-        let result = writer.write_all(buf);
-        exit_blocking();
-        result
+        writer.write_all(buf)
     }
 
     pub fn write_file<P: AsRef<Path>>(path: P, contents: &[u8]) -> io::Result<()> {
         enter_blocking();
-        let result = std::fs::write(path, contents);
-        exit_blocking();
-        result
+        std::fs::write(path, contents)
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
         enter_blocking();
-        let result = File::open(path);
-        exit_blocking();
-        result
+        File::open(path)
     }
 
     pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
         enter_blocking();
-        let result = File::create(path);
-        exit_blocking();
-        result
+        File::create(path)
     }
 }

@@ -1,0 +1,256 @@
+--- src/runtime/poll.rs	2025-12-04 22:37:04.168568697 +0900
++++ src/runtime/timer.rs	2025-12-04 22:42:24.118515901 +0900
+@@ -1,19 +1,19 @@
+-//! M:N Green Thread Runtime with Network Polling
++//! M:N Green Thread Runtime with Network Polling and Timers
+ //!
+-//! Extends the basic M:N runtime with:
+-//! - gopark/goready for cooperative waiting
+-//! - Network I/O polling with epoll (Linux) or kqueue (macOS/BSD)
+-//! - Workers that sleep when idle (instead of terminating)
++//! Extends mn_poll with:
++//! - Timer heap for sleep()
++//! - epoll/kqueue timeout integration with timers
+ 
+ use crate::common::{
+     Context, Task, TaskId, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
+ };
+ use crate::netpoll;
+-use std::collections::{HashMap, VecDeque};
++use std::collections::{BinaryHeap, HashMap, VecDeque};
+ use std::os::fd::AsRawFd;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Condvar, Mutex, OnceLock};
+ use std::thread;
++use std::time::{Duration, Instant};
+ 
+ /// Global task queue
+ static GLOBAL_QUEUE: OnceLock<Mutex<GlobalQueue>> = OnceLock::new();
+@@ -90,12 +90,13 @@
+ fn should_terminate(queue: &GlobalQueue) -> bool {
+     // Terminate when:
+     // - No runnable tasks
+-    // - No waiting tasks (including network waiters)
+-    // - All workers are idle (except us, who is checking)
++    // - No waiting tasks (including network waiters and timers)
++    // - All workers are idle
+     queue.runnable.is_empty()
+         && queue.waiting.is_empty()
+         && !network_poller().has_waiters()
+-        && queue.idle_workers == queue.all_workers - 1
++        && !has_timers()
++        && queue.idle_workers == queue.all_workers
+ }
+ 
+ fn worker_loop(worker_id: usize) {
+@@ -118,27 +119,38 @@
+                     task.state = TaskState::Running;
+                     Some(task)
+                 } else {
+-                    // No runnable tasks - check for termination
+-                    if should_terminate(&q) {
+-                        // Wake up all other workers so they can also terminate
+-                        condvar.notify_all();
+-                        q.all_workers -= 1;
+-                        return; // Exit the closure, ending the loop
+-                    }
+-
++                    // No runnable tasks - try polling before going idle
+                     // Drop lock before polling (polling may block)
+                     drop(q);
+ 
+                     // Try to become the poller
+                     if try_poll_network() {
+-                        // We did some polling, there might be work now
+-                        // Loop back to check runnable queue
++                        // We did some polling, loop back to check for work
+                         None
+                     } else {
+-                        // Another worker is polling, or no network waiters
+-                        // Go idle and wait for work
++                        // Another worker is polling, or no waiters
++                        // Check external state before taking queue lock (avoid lock order issues)
++                        let has_net_waiters = network_poller().has_waiters();
++                        let has_timer_waiters = has_timers();
++
++                        // Go idle
+                         let mut q = queue.lock().unwrap();
+                         q.idle_workers += 1;
++
++                        // Check termination (like Go's checkdead() in mput())
++                        let should_term = q.runnable.is_empty()
++                            && q.waiting.is_empty()
++                            && !has_net_waiters
++                            && !has_timer_waiters
++                            && q.idle_workers == q.all_workers;
++
++                        if should_term {
++                            condvar.notify_all();
++                            q.all_workers -= 1;
++                            return;
++                        }
++
++                        // Wait for work
+                         let mut q = condvar.wait(q).unwrap();
+                         q.idle_workers -= 1;
+ 
+@@ -221,6 +233,23 @@
+     })
+ }
+ 
++/// Sleep for the specified duration
++///
++/// Parks the current task and wakes it up after the duration has elapsed.
++pub fn sleep(duration: Duration) {
++    let wake_time = Instant::now() + duration;
++    let task_id = current_task_id();
++
++    // Add to timer heap
++    timer_heap()
++        .lock()
++        .unwrap()
++        .push(TimerEntry { wake_time, task_id });
++
++    // Park until timer fires
++    gopark();
++}
++
+ /// Wake up a parked task (move back to runnable state)
+ pub fn goready(task_id: TaskId) {
+     let queue = global_queue();
+@@ -416,6 +445,65 @@
+     netpoll::net_poller()
+ }
+ 
++// ============================================================================
++// Timer Heap
++// ============================================================================
++
++/// Entry in the timer heap
++#[derive(Eq, PartialEq)]
++struct TimerEntry {
++    wake_time: Instant,
++    task_id: TaskId,
++}
++
++impl Ord for TimerEntry {
++    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
++        // Reverse order for min-heap (earliest wake time first)
++        other.wake_time.cmp(&self.wake_time)
++    }
++}
++
++impl PartialOrd for TimerEntry {
++    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
++        Some(self.cmp(other))
++    }
++}
++
++/// Global timer heap
++static TIMER_HEAP: OnceLock<Mutex<BinaryHeap<TimerEntry>>> = OnceLock::new();
++
++fn timer_heap() -> &'static Mutex<BinaryHeap<TimerEntry>> {
++    TIMER_HEAP.get_or_init(|| Mutex::new(BinaryHeap::new()))
++}
++
++/// Check and fire expired timers, returns the next wake time if any
++fn check_timers() -> Option<Instant> {
++    let now = Instant::now();
++    let mut heap = timer_heap().lock().unwrap();
++
++    // Fire all expired timers
++    while let Some(entry) = heap.peek() {
++        if entry.wake_time <= now {
++            let entry = heap.pop().unwrap();
++            let task_id = entry.task_id;
++            // Drop lock before calling goready to avoid deadlock
++            drop(heap);
++            goready(task_id);
++            heap = timer_heap().lock().unwrap();
++        } else {
++            break;
++        }
++    }
++
++    // Return next wake time
++    heap.peek().map(|e| e.wake_time)
++}
++
++/// Check if there are any pending timers
++fn has_timers() -> bool {
++    !timer_heap().lock().unwrap().is_empty()
++}
++
+ /// Wait for an fd to become readable
+ ///
+ /// Parks the current task until the fd is ready for reading.
+@@ -434,7 +522,7 @@
+     poller.unregister(raw_fd);
+ }
+ 
+-/// Try to become the poller and poll for network events
++/// Try to become the poller and poll for network/timer events
+ /// Returns true if we did polling, false if another worker is already polling
+ fn try_poll_network() -> bool {
+     // Try to become the poller (only one worker can poll at a time)
+@@ -446,20 +534,55 @@
+     }
+ 
+     let poller = network_poller();
++    let has_net_waiters = poller.has_waiters();
++    let has_timer_waiters = has_timers();
+ 
+-    // Only poll if there are waiters
+-    if !poller.has_waiters() {
++    // Only poll if there are waiters (network or timer)
++    if !has_net_waiters && !has_timer_waiters {
+         POLLING.store(false, Ordering::Release);
+         return false;
+     }
+ 
+-    // Poll with a timeout (100ms) to avoid blocking forever
+-    let ready_tasks = poller.poll(100);
++    // Check timers first, get timeout for next timer
++    let timeout_ms = match check_timers() {
++        Some(next_wake) => {
++            let now = Instant::now();
++            if next_wake <= now {
++                0
++            } else {
++                // Time until next timer (max 100ms)
++                (next_wake - now).as_millis().min(100) as i32
++            }
++        }
++        None => {
++            // No more timers (check_timers already woke up expired ones)
++            if !has_net_waiters {
++                // Nothing left to wait for - return so caller can check termination
++                POLLING.store(false, Ordering::Release);
++                return true;
++            }
++            100 // Default timeout for network only
++        }
++    };
++
++    // Poll for network events or wait for timer
++    let ready_tasks = if has_net_waiters {
++        poller.poll(timeout_ms)
++    } else {
++        // No network waiters, just sleep for timer
++        if timeout_ms > 0 {
++            std::thread::sleep(Duration::from_millis(timeout_ms as u64));
++        }
++        Vec::new()
++    };
++
++    // Check timers again after poll/sleep
++    check_timers();
+ 
+     // Release polling flag before waking tasks
+     POLLING.store(false, Ordering::Release);
+ 
+-    // Wake up ready tasks
++    // Wake up ready tasks (from network)
+     for task_id in ready_tasks {
+         goready(TaskId::from_u64(task_id));
+     }
