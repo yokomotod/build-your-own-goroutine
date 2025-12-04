@@ -1,4 +1,10 @@
-use mygoroutine::mn::{go, start_runtime};
+//! Network polling example using TCP connections
+//!
+//! This example demonstrates that network I/O doesn't block workers.
+//! Unlike thread::sleep which blocks the worker, net_poll_read uses epoll
+//! to park the task and allow other tasks to run.
+
+use mygoroutine::mn_poll::{go, net_poll_read, start_runtime};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -8,7 +14,7 @@ const NUM_THREADS: usize = 4;
 const NUM_TASKS: usize = 32;
 
 fn main() {
-    println!("=== M:N Runtime (NO network polling) ===");
+    println!("=== mn_poll Network I/O Demo ===");
     println!("Running {} tasks with network I/O on {} workers\n", NUM_TASKS, NUM_THREADS);
 
     // Start a simple echo server in a separate thread
@@ -31,6 +37,7 @@ fn main() {
 
     let start = Instant::now();
 
+    // Spawn tasks that do network I/O
     for i in 0..NUM_TASKS {
         let addr = addr;
         go(move || {
@@ -40,14 +47,18 @@ fn main() {
                 i
             );
 
-            // Blocking connect and read (no epoll)
             let mut stream = TcpStream::connect(addr).unwrap();
+            stream.set_nonblocking(true).unwrap();
 
             // Send request
             let msg = format!("Hello from task {}", i);
-            stream.write_all(msg.as_bytes()).unwrap();
+            // For non-blocking write, we might get WouldBlock, but for small writes it usually succeeds
+            stream.write_all(msg.as_bytes()).ok();
 
-            // Blocking read - this blocks the worker!
+            // Wait for response using epoll
+            net_poll_read(&stream);
+
+            // Read response
             let mut buf = [0u8; 64];
             match stream.read(&mut buf) {
                 Ok(n) => {
@@ -75,8 +86,9 @@ fn main() {
 
     println!("\nTotal elapsed: {:?}", start.elapsed());
     println!();
-    println!("With blocking read: Workers are blocked during network I/O");
-    println!("Expected: ~800ms (4 threads blocked, 32 tasks, 8 rounds of 100ms)");
+    println!("Expected with blocking (thread::sleep): ~800ms (4 threads, 32 tasks, 8 rounds)");
+    println!("Expected with epoll: ~100ms (all tasks wait concurrently)");
+    println!("The difference shows that network I/O doesn't block workers!");
 
-    drop(server_handle);
+    drop(server_handle); // Server thread continues until process exits
 }
