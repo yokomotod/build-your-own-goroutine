@@ -1,4 +1,4 @@
-use mygoroutine::runtime::m1::{go, start_runtime};
+use mygoroutine::runtime::green::{go, start_runtime};
 use std::hint::black_box;
 use std::time::Instant;
 

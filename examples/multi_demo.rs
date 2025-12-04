@@ -1,4 +1,4 @@
-use mygoroutine::runtime::mn::{go, gosched, start_runtime};
+use mygoroutine::runtime::multi::{go, gosched, start_runtime};
 
 const NUM_THREADS: usize = 4;
 

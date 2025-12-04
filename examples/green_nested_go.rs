@@ -1,4 +1,4 @@
-use mygoroutine::runtime::m1::{go, gosched, start_runtime};
+use mygoroutine::runtime::green::{go, gosched, start_runtime};
 use std::cell::RefCell;
 use std::rc::Rc;
 

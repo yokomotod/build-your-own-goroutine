@@ -2,7 +2,7 @@
 //!
 //! Uses std::fs/std::io directly, so workers get blocked and can't run other tasks.
 
-use mygoroutine::runtime::mn::{go, start_runtime};
+use mygoroutine::runtime::multi::{go, start_runtime};
 use std::io::Read;
 use std::time::Instant;
 
