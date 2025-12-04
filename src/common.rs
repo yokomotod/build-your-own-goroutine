@@ -1,5 +1,6 @@
 //! Common components for green thread runtimes.
 
+use std::cell::{RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // Re-export architecture-specific items
@@ -76,5 +77,45 @@ impl Task {
             _stack: stack,
             state: TaskState::Runnable,
         }
+    }
+}
+
+/// Per-thread worker state (used by M:N runtimes)
+pub struct Worker {
+    /// Context to return to when a task yields
+    pub context: UnsafeCell<Context>,
+    /// Currently running task
+    pub current_task: RefCell<Option<Task>>,
+}
+
+impl Worker {
+    pub fn new() -> Self {
+        Worker {
+            context: UnsafeCell::new(Context::default()),
+            current_task: RefCell::new(None),
+        }
+    }
+
+    pub fn switch_to_scheduler(&self) {
+        // Get pointers before context_switch (to avoid holding RefCell borrow across switch)
+        let task_ctx: *mut Context = {
+            let mut task = self.current_task.borrow_mut();
+            &mut task
+                .as_mut()
+                .expect("switch_to_scheduler called without current task")
+                .context as *mut Context
+        }; // RefMut is dropped here
+
+        let worker_ctx: *const Context = self.context.get();
+
+        // Note: We use raw pointers because context_switch requires simultaneous
+        // access to two Contexts, which Rust's borrow checker cannot express.
+        context_switch(task_ctx, worker_ctx);
+    }
+}
+
+impl Default for Worker {
+    fn default() -> Self {
+        Self::new()
     }
 }

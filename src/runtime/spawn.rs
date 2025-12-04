@@ -4,8 +4,9 @@
 //! When a task enters a blocking operation (like file I/O),
 //! the runtime spawns a new worker to keep other tasks running.
 
-use crate::common::{Context, Task, TaskState, context_switch, get_closure_ptr, prepare_stack};
-use std::cell::{RefCell, UnsafeCell};
+use crate::common::{
+    Context, Task, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
+};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
@@ -74,36 +75,6 @@ struct GlobalQueue {
     all_workers: usize,
     /// Next worker ID to assign
     next_worker_id: usize,
-}
-
-/// Per-thread worker state
-struct Worker {
-    /// Context to return to when a task yields
-    context: UnsafeCell<Context>,
-    /// Currently running task
-    current_task: RefCell<Option<Task>>,
-}
-
-impl Worker {
-    fn new() -> Self {
-        Worker {
-            context: UnsafeCell::new(Context::default()),
-            current_task: RefCell::new(None),
-        }
-    }
-
-    fn switch_to_scheduler(&self) {
-        let task_ctx: *mut Context = {
-            let mut task = self.current_task.borrow_mut();
-            &mut task
-                .as_mut()
-                .expect("switch_to_scheduler called without current task")
-                .context as *mut Context
-        };
-
-        let worker_ctx: *const Context = self.context.get();
-        context_switch(task_ctx, worker_ctx);
-    }
 }
 
 /// Check if the runtime should terminate
@@ -177,10 +148,11 @@ fn worker_loop(worker_id: usize) {
 
             // Task yielded or finished
             if let Some(mut task) = worker.current_task.borrow_mut().take()
-                && task.state != TaskState::Dead {
-                    task.state = TaskState::Runnable;
-                    queue.lock().unwrap().tasks.push_back(task);
-                }
+                && task.state != TaskState::Dead
+            {
+                task.state = TaskState::Runnable;
+                queue.lock().unwrap().tasks.push_back(task);
+            }
         }
     });
 

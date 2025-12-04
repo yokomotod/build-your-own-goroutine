@@ -6,10 +6,9 @@
 //! - Workers that sleep when idle (instead of terminating)
 
 use crate::common::{
-    Context, Task, TaskId, TaskState, context_switch, get_closure_ptr, prepare_stack,
+    Context, Task, TaskId, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
 };
 use crate::netpoll;
-use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,36 +82,6 @@ struct GlobalQueue {
     all_workers: usize,
     /// Next worker ID to assign
     next_worker_id: usize,
-}
-
-/// Per-thread worker state
-struct Worker {
-    /// Context to return to when a task yields
-    context: UnsafeCell<Context>,
-    /// Currently running task
-    current_task: RefCell<Option<Task>>,
-}
-
-impl Worker {
-    fn new() -> Self {
-        Worker {
-            context: UnsafeCell::new(Context::default()),
-            current_task: RefCell::new(None),
-        }
-    }
-
-    fn switch_to_scheduler(&self) {
-        let task_ctx: *mut Context = {
-            let mut task = self.current_task.borrow_mut();
-            &mut task
-                .as_mut()
-                .expect("switch_to_scheduler called without current task")
-                .context as *mut Context
-        };
-
-        let worker_ctx: *const Context = self.context.get();
-        context_switch(task_ctx, worker_ctx);
-    }
 }
 
 /// Check if the runtime should terminate
