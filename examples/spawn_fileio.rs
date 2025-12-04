@@ -3,7 +3,7 @@
 //! Uses the io module's blocking-aware wrappers to automatically
 //! spawn new workers when file I/O blocks.
 
-use mygoroutine::runtime::poll::{go, io, start_runtime};
+use mygoroutine::runtime::spawn::{go, io, start_runtime};
 use std::time::Instant;
 
 const NUM_THREADS: usize = 1;
@@ -17,7 +17,7 @@ fn read_urandom() {
 }
 
 fn main() {
-    println!("=== mn_poll File I/O ===\n");
+    println!("=== spawn: File I/O with dynamic worker spawning ===\n");
 
     // Baseline: 1 task
     println!("--- Baseline: 1 task ---");
@@ -27,7 +27,7 @@ fn main() {
     let baseline = start.elapsed();
     println!("1 task: {:?}\n", baseline);
 
-    // Main test: 8 tasks
+    // Main test: multiple tasks
     println!("--- Main: {} tasks with {} initial workers ---", NUM_TASKS, NUM_THREADS);
     let start = Instant::now();
     for _ in 0..NUM_TASKS {
