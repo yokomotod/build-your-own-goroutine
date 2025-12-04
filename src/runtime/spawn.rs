@@ -4,7 +4,7 @@
 //! When a task enters a blocking operation (like file I/O),
 //! the runtime spawns a new worker to keep other tasks running.
 
-use crate::common::{Context, Task, context_switch, get_closure_ptr, prepare_stack};
+use crate::common::{Context, Task, TaskState, context_switch, get_closure_ptr, prepare_stack};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -44,7 +44,7 @@ fn task_finished() {
             .borrow_mut()
             .as_mut()
             .expect("task_finished called without current task")
-            .finished = true;
+            .state = TaskState::Dead;
 
         worker.switch_to_scheduler();
     });
@@ -127,7 +127,8 @@ fn worker_loop(worker_id: usize) {
             let task = {
                 let mut q = queue.lock().unwrap();
 
-                if let Some(task) = q.tasks.pop_front() {
+                if let Some(mut task) = q.tasks.pop_front() {
+                    task.state = TaskState::Running;
                     Some(task)
                 } else {
                     // No runnable tasks - check for termination
@@ -149,7 +150,12 @@ fn worker_loop(worker_id: usize) {
                         return;
                     }
 
-                    q.tasks.pop_front()
+                    if let Some(mut task) = q.tasks.pop_front() {
+                        task.state = TaskState::Running;
+                        Some(task)
+                    } else {
+                        None
+                    }
                 }
             };
 
@@ -170,10 +176,11 @@ fn worker_loop(worker_id: usize) {
             context_switch(worker_ctx, task_ctx);
 
             // Task yielded or finished
-            if let Some(task) = worker.current_task.borrow_mut().take()
-                && !task.finished
-            {
-                queue.lock().unwrap().tasks.push_back(task);
+            if let Some(mut task) = worker.current_task.borrow_mut().take() {
+                if task.state != TaskState::Dead {
+                    task.state = TaskState::Runnable;
+                    queue.lock().unwrap().tasks.push_back(task);
+                }
             }
         }
     });

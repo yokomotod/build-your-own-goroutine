@@ -18,7 +18,7 @@
 //! start_runtime();
 //! ```
 
-use crate::common::{Context, Task, context_switch, get_closure_ptr, prepare_stack};
+use crate::common::{Context, Task, TaskState, context_switch, get_closure_ptr, prepare_stack};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 
@@ -34,7 +34,7 @@ fn task_finished() {
             .borrow_mut()
             .as_mut()
             .expect("task_finished called without current task")
-            .finished = true;
+            .state = TaskState::Dead;
 
         worker.switch_to_scheduler();
     });
@@ -116,11 +116,11 @@ fn worker_loop() {
             context_switch(worker_ctx, task_ctx);
 
             // Task yielded or finished (borrow ends immediately)
-            if let Some(task) = worker.current_task.borrow_mut().take()
-                && !task.finished
-            {
-                // Task yielded, put back to queue
-                worker.tasks.borrow_mut().push_back(task);
+            if let Some(task) = worker.current_task.borrow_mut().take() {
+                if task.state != TaskState::Dead {
+                    // Task yielded, put back to queue
+                    worker.tasks.borrow_mut().push_back(task);
+                }
             }
             // If finished, just drop it
         }

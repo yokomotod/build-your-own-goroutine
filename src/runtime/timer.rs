@@ -4,7 +4,7 @@
 //! - Timer heap for sleep()
 //! - epoll/kqueue timeout integration with timers
 
-use crate::common::{Context, Task, context_switch, get_closure_ptr, prepare_stack};
+use crate::common::{Context, Task, TaskId, TaskState, context_switch, get_closure_ptr, prepare_stack};
 use crate::netpoll;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -13,44 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// Unique identifier for each task
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TaskId(u64);
-
-impl TaskId {
-    fn new() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-
-    fn as_u64(self) -> u64 {
-        self.0
-    }
-
-    fn from_u64(id: u64) -> Self {
-        TaskId(id)
-    }
-}
-
-/// Task state
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum TaskState {
-    /// In the runnable queue, waiting to be scheduled
-    Runnable,
-    /// Currently running on a worker
-    Running,
-    /// Waiting for I/O or other event (not in any queue)
-    Waiting,
-}
-
-/// Extended task with ID and state
-struct TaskEntry {
-    id: TaskId,
-    task: Task,
-    state: TaskState,
-}
 
 /// Global task queue
 static GLOBAL_QUEUE: OnceLock<Mutex<GlobalQueue>> = OnceLock::new();
@@ -87,8 +49,7 @@ fn task_finished() {
             .borrow_mut()
             .as_mut()
             .expect("task_finished called without current task")
-            .task
-            .finished = true;
+            .state = TaskState::Dead;
 
         worker.switch_to_scheduler();
     });
@@ -111,9 +72,9 @@ where
 /// Global task queue shared by all workers
 struct GlobalQueue {
     /// Queue of runnable tasks
-    runnable: VecDeque<TaskEntry>,
+    runnable: VecDeque<Task>,
     /// Tasks waiting for I/O or other events
-    waiting: HashMap<TaskId, TaskEntry>,
+    waiting: HashMap<TaskId, Task>,
     /// Number of idle workers (waiting on condvar)
     idle_workers: usize,
     /// Total number of workers
@@ -127,7 +88,7 @@ struct Worker {
     /// Context to return to when a task yields
     context: UnsafeCell<Context>,
     /// Currently running task
-    current_task: RefCell<Option<TaskEntry>>,
+    current_task: RefCell<Option<Task>>,
 }
 
 impl Worker {
@@ -144,7 +105,6 @@ impl Worker {
             &mut task
                 .as_mut()
                 .expect("switch_to_scheduler called without current task")
-                .task
                 .context as *mut Context
         };
 
@@ -179,12 +139,12 @@ fn worker_loop(worker_id: usize) {
     CURRENT_WORKER.with(|worker| {
         loop {
             // Get task from global queue
-            let task_entry = {
+            let task = {
                 let mut q = queue.lock().unwrap();
 
-                if let Some(mut entry) = q.runnable.pop_front() {
-                    entry.state = TaskState::Running;
-                    Some(entry)
+                if let Some(mut task) = q.runnable.pop_front() {
+                    task.state = TaskState::Running;
+                    Some(task)
                 } else {
                     // No runnable tasks - try polling before going idle
                     // Drop lock before polling (polling may block)
@@ -229,9 +189,9 @@ fn worker_loop(worker_id: usize) {
                         }
 
                         // Try to get a task
-                        if let Some(mut entry) = q.runnable.pop_front() {
-                            entry.state = TaskState::Running;
-                            Some(entry)
+                        if let Some(mut task) = q.runnable.pop_front() {
+                            task.state = TaskState::Running;
+                            Some(task)
                         } else {
                             None
                         }
@@ -239,35 +199,39 @@ fn worker_loop(worker_id: usize) {
                 }
             };
 
-            let Some(task_entry) = task_entry else {
+            let Some(task) = task else {
                 // Spurious wakeup, loop again
                 continue;
             };
 
             // Set current task
-            *worker.current_task.borrow_mut() = Some(task_entry);
+            *worker.current_task.borrow_mut() = Some(task);
 
             // Get pointers before context_switch
             let worker_ctx: *mut Context = worker.context.get();
             let task_ctx: *const Context = {
                 let task = worker.current_task.borrow();
-                &task.as_ref().unwrap().task.context as *const Context
+                &task.as_ref().unwrap().context as *const Context
             };
 
             context_switch(worker_ctx, task_ctx);
 
             // Task yielded or finished
-            if let Some(mut entry) = worker.current_task.borrow_mut().take() {
-                if entry.task.finished {
-                    // Task finished, drop it
-                } else if entry.state == TaskState::Waiting {
-                    // gopark was called - move task to waiting map
-                    let mut q = queue.lock().unwrap();
-                    q.waiting.insert(entry.id, entry);
-                } else {
-                    // Normal yield (gosched), put back to runnable queue
-                    entry.state = TaskState::Runnable;
-                    queue.lock().unwrap().runnable.push_back(entry);
+            if let Some(mut task) = worker.current_task.borrow_mut().take() {
+                match task.state {
+                    TaskState::Dead => {
+                        // Task finished, drop it
+                    }
+                    TaskState::Waiting => {
+                        // gopark was called - move task to waiting map
+                        let mut q = queue.lock().unwrap();
+                        q.waiting.insert(task.id, task);
+                    }
+                    _ => {
+                        // Normal yield (gosched), put back to runnable queue
+                        task.state = TaskState::Runnable;
+                        queue.lock().unwrap().runnable.push_back(task);
+                    }
                 }
             }
         }
@@ -283,8 +247,8 @@ pub fn gopark() {
     CURRENT_WORKER.with(|worker| {
         {
             let mut current = worker.current_task.borrow_mut();
-            let entry = current.as_mut().expect("gopark called without current task");
-            entry.state = TaskState::Waiting;
+            let task = current.as_mut().expect("gopark called without current task");
+            task.state = TaskState::Waiting;
         }
 
         // Switch to scheduler - it will move this task to waiting map
@@ -316,9 +280,9 @@ pub fn goready(task_id: TaskId) {
 
     let mut q = queue.lock().unwrap();
 
-    if let Some(mut entry) = q.waiting.remove(&task_id) {
-        entry.state = TaskState::Runnable;
-        q.runnable.push_back(entry);
+    if let Some(mut task) = q.waiting.remove(&task_id) {
+        task.state = TaskState::Runnable;
+        q.runnable.push_back(task);
 
         // Wake up an idle worker if any
         if q.idle_workers > 0 {
@@ -349,17 +313,11 @@ where
     let context = Context::new(stack_top, task_entry::<F> as usize, f_ptr);
     let task = Task::new(context, stack);
 
-    let entry = TaskEntry {
-        id: TaskId::new(),
-        task,
-        state: TaskState::Runnable,
-    };
-
     let queue = global_queue();
     let condvar = worker_condvar();
 
     let mut q = queue.lock().unwrap();
-    q.runnable.push_back(entry);
+    q.runnable.push_back(task);
 
     // Wake up an idle worker if any
     if q.idle_workers > 0 {
