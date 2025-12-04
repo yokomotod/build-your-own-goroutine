@@ -3,7 +3,7 @@
 //! Uses the io module's blocking-aware wrappers to automatically
 //! spawn new workers when file I/O blocks.
 
-use mygoroutine::mn_poll::{go, io, start_runtime};
+use mygoroutine::runtime::poll::{go, io, start_runtime};
 use std::time::Instant;
 
 const NUM_THREADS: usize = 1;

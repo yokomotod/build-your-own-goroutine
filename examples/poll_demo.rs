@@ -4,7 +4,7 @@
 //! Unlike thread::sleep which blocks the worker, net_poll_read uses epoll
 //! to park the task and allow other tasks to run.
 
-use mygoroutine::mn_poll::{go, net_poll_read, start_runtime};
+use mygoroutine::runtime::poll::{go, net_poll_read, start_runtime};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;

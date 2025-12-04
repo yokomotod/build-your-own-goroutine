@@ -1,6 +1,6 @@
 //! Basic test for mn_poll module - testing gopark/goready without network I/O
 
-use mygoroutine::mn_poll::{current_task_id, go, gopark, goready, start_runtime, TaskId};
+use mygoroutine::runtime::poll::{current_task_id, go, gopark, goready, start_runtime, TaskId};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};

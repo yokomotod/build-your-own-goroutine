@@ -3,7 +3,7 @@
 //! Shows that multiple tasks can sleep concurrently without
 //! blocking workers, unlike thread::sleep.
 
-use mygoroutine::mn_poll_timer::{go, sleep, start_runtime};
+use mygoroutine::runtime::timer::{go, sleep, start_runtime};
 use std::time::{Duration, Instant};
 
 const NUM_THREADS: usize = 2;
