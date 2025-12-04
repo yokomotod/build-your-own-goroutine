@@ -1,9 +1,9 @@
-//! File I/O example WITHOUT dynamic worker spawning (for comparison)
+//! File I/O example demonstrating dynamic worker spawning
 //!
-//! Uses std::fs/std::io directly, so workers get blocked and can't run other tasks.
+//! Uses the io module's blocking-aware wrappers to automatically
+//! spawn new workers when file I/O blocks.
 
-use mygoroutine::mn::{go, start_runtime};
-use std::io::Read;
+use mygoroutine::mn_poll::{go, io, start_runtime};
 use std::time::Instant;
 
 const NUM_THREADS: usize = 1;
@@ -11,13 +11,13 @@ const NUM_TASKS: usize = 10;
 const READ_SIZE: usize = 100 * 1024 * 1024; // 100MB
 
 fn read_urandom() {
-    let mut file = std::fs::File::open("/dev/urandom").unwrap();
+    let mut file = io::open("/dev/urandom").unwrap();
     let mut buf = vec![0u8; READ_SIZE];
-    file.read_exact(&mut buf).unwrap();
+    io::read_exact(&mut file, &mut buf).unwrap();
 }
 
 fn main() {
-    println!("=== M:N Runtime (NO dynamic worker spawning) ===\n");
+    println!("=== mn_poll File I/O ===\n");
 
     // Baseline: 1 task
     println!("--- Baseline: 1 task ---");
