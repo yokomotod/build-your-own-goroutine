@@ -1,3 +1,4 @@
+pub mod channel;
 pub mod green;
 pub mod multi;
 pub mod poll;
