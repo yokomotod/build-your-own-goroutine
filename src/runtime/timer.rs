@@ -8,7 +8,7 @@ use crate::common::{
     Context, Task, TaskId, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
 };
 use crate::netpoll;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -24,6 +24,7 @@ fn global_queue() -> &'static Mutex<GlobalQueue> {
         Mutex::new(GlobalQueue {
             runnable: VecDeque::new(),
             waiting: HashMap::new(),
+            pre_ready: HashSet::new(),
             idle_workers: 0,
             all_workers: 0,
             next_worker_id: 0,
@@ -78,6 +79,10 @@ struct GlobalQueue {
     runnable: VecDeque<Task>,
     /// Tasks waiting for I/O or other events
     waiting: HashMap<TaskId, Task>,
+    /// Tasks that were goready'd before being placed in waiting map.
+    /// Solves the race between gopark (context switch) and goready:
+    /// goready may fire before the worker loop moves the task to waiting.
+    pre_ready: HashSet<TaskId>,
     /// Number of idle workers (waiting on condvar)
     idle_workers: usize,
     /// Total number of workers
@@ -94,6 +99,7 @@ fn should_terminate(queue: &GlobalQueue) -> bool {
     // - All workers are idle
     queue.runnable.is_empty()
         && queue.waiting.is_empty()
+        && queue.pre_ready.is_empty()
         && !network_poller().has_waiters()
         && !has_timers()
         && queue.idle_workers == queue.all_workers
@@ -140,6 +146,7 @@ fn worker_loop(worker_id: usize) {
                         // Check termination (like Go's checkdead() in mput())
                         let should_term = q.runnable.is_empty()
                             && q.waiting.is_empty()
+                            && q.pre_ready.is_empty()
                             && !has_net_waiters
                             && !has_timer_waiters
                             && q.idle_workers == q.all_workers;
@@ -200,7 +207,13 @@ fn worker_loop(worker_id: usize) {
                     TaskState::Waiting => {
                         // gopark was called - move task to waiting map
                         let mut q = queue.lock().unwrap();
-                        q.waiting.insert(task.id, task);
+                        if q.pre_ready.remove(&task.id) {
+                            // goready was called before we got here - go straight back to runnable
+                            task.state = TaskState::Runnable;
+                            q.runnable.push_back(task);
+                        } else {
+                            q.waiting.insert(task.id, task);
+                        }
                     }
                     _ => {
                         // Normal yield (gosched), put back to runnable queue
@@ -265,6 +278,9 @@ pub fn goready(task_id: TaskId) {
         if q.idle_workers > 0 {
             condvar.notify_one();
         }
+    } else {
+        // Task not yet in waiting map (gopark in progress) - mark for immediate wakeup
+        q.pre_ready.insert(task_id);
     }
 }
 
