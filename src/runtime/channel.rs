@@ -642,6 +642,8 @@ struct ChanInner<T> {
     /// Data delivered to a receiver via direct send (Go: sendDirect alternative)
     /// Key is the receiver's task ID; value is the data sent to it.
     delivered: HashMap<TaskId, T>,
+    /// Whether the channel has been closed (Go: closed)
+    closed: bool,
 }
 
 /// Channel for communication between goroutines (Go: hchan)
@@ -663,6 +665,12 @@ impl<T> Clone for Chan<T> {
     }
 }
 
+impl<T: Send + 'static> Default for Chan<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Send + 'static> Chan<T> {
     /// Create a new unbuffered channel (Go: make(chan T))
     pub fn new() -> Self {
@@ -678,6 +686,7 @@ impl<T: Send + 'static> Chan<T> {
                 sendq: VecDeque::new(),
                 recvq: VecDeque::new(),
                 delivered: HashMap::new(),
+                closed: false,
             })),
         }
     }
@@ -685,9 +694,15 @@ impl<T: Send + 'static> Chan<T> {
     /// Send a value on the channel (Go: chansend, chan.go:176-310)
     ///
     /// Blocks until a receiver is ready or the buffer has space.
+    /// Panics if the channel is closed (Go: chan.go:224-227).
     pub fn send(&self, data: T) {
         {
             let mut inner = self.inner.lock().unwrap();
+
+            // Closed channel check (Go: chan.go:224-227)
+            if inner.closed {
+                panic!("send on closed channel");
+            }
 
             // Fast path: a receiver is already waiting (Go: chan.go:229-234)
             if let Some(receiver_id) = inner.recvq.pop_front() {
@@ -711,15 +726,26 @@ impl<T: Send + 'static> Chan<T> {
         }
 
         gopark(); // Go: gopark(chanparkcommit, ...) — we use pending_ready instead
+
+        // Woken up by close (Go: chan.go:303-308)
+        let inner = self.inner.lock().unwrap();
+        if inner.closed {
+            panic!("send on closed channel");
+        }
     }
 
     /// Receive a value from the channel (Go: chanrecv, chan.go:524-686)
     ///
-    /// Blocks until a value is available.
-    /// Returns `Some(value)` on success.
+    /// Returns `Some(value)` on success, `None` if the channel is closed
+    /// and empty (Go: chan.go:588-598).
     pub fn recv(&self) -> Option<T> {
         {
             let mut inner = self.inner.lock().unwrap();
+
+            // Closed + no pending data → return None (Go: chan.go:588-598)
+            if inner.closed && inner.sendq.is_empty() && inner.buf.is_empty() {
+                return None;
+            }
 
             // A sender is already waiting (Go: chan.go:602-609)
             if let Some(sender) = inner.sendq.pop_front() {
@@ -746,6 +772,11 @@ impl<T: Send + 'static> Chan<T> {
                 return Some(data);
             }
 
+            // Closed + empty → return None
+            if inner.closed {
+                return None;
+            }
+
             // Slow path: no sender and buffer empty, block (Go: chan.go:636-686)
             let task_id = current_task_id();
             inner.recvq.push_back(task_id);
@@ -754,9 +785,42 @@ impl<T: Send + 'static> Chan<T> {
 
         gopark(); // Go: gopark(chanparkcommit, ...) — we use pending_ready instead
 
-        // Woken up — retrieve the data that was delivered to us
+        // Woken up — check if data was delivered or if we were woken by close
+        // Some(data) = normal wakeup (Go: success=true)
+        // None = woken by close (Go: success=false)
         let mut inner = self.inner.lock().unwrap();
-        let data = inner.delivered.remove(&current_task_id()).unwrap();
-        Some(data)
+        inner.delivered.remove(&current_task_id())
+    }
+
+    /// Close the channel (Go: closechan, chan.go:414-486)
+    ///
+    /// Wakes all waiting senders (they will panic) and receivers (they get None).
+    /// Panics if the channel is already closed.
+    pub fn close(&self) {
+        let (receivers, senders) = {
+            let mut inner = self.inner.lock().unwrap();
+
+            // Already closed → panic (Go: chan.go:425-426)
+            if inner.closed {
+                panic!("close of closed channel");
+            }
+
+            inner.closed = true; // Go: chan.go:434
+
+            // Collect all waiters (Go: chan.go:439-477)
+            let receivers: Vec<TaskId> = inner.recvq.drain(..).collect();
+            let senders: Vec<TaskId> = inner.sendq.drain(..).map(|w| w.task_id).collect();
+
+            (receivers, senders)
+            // unlock here (Go: chan.go:478)
+        };
+
+        // Wake all waiters outside the lock (Go: chan.go:481-485)
+        for id in receivers {
+            goready(id);
+        }
+        for id in senders {
+            goready(id);
+        }
     }
 }

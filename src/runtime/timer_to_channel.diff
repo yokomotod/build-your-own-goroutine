@@ -1,0 +1,315 @@
+--- src/runtime/timer.rs	2026-02-15 12:57:43.956720513 +0900
++++ src/runtime/channel.rs	2026-02-15 13:05:59.947463961 +0900
+@@ -1,14 +1,14 @@
+-//! M:N Green Thread Runtime with Network Polling and Timers
++//! M:N Green Thread Runtime with Network Polling, Timers, and Channels
+ //!
+-//! Extends mn_poll with:
+-//! - Timer heap for sleep()
+-//! - epoll/kqueue timeout integration with timers
++//! Extends mn_timer with:
++//! - Channel (CSP-style communication between goroutines)
++//! - pending_ready mechanism for gopark/goready race condition
+ 
+ use crate::common::{
+     Context, Task, TaskId, TaskState, Worker, context_switch, get_closure_ptr, prepare_stack,
+ };
+ use crate::netpoll;
+-use std::collections::{BinaryHeap, HashMap, VecDeque};
++use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+ use std::os::fd::AsRawFd;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Condvar, Mutex, OnceLock};
+@@ -24,6 +24,7 @@
+         Mutex::new(GlobalQueue {
+             runnable: VecDeque::new(),
+             waiting: HashMap::new(),
++            pending_ready: HashSet::new(),
+             idle_workers: 0,
+             all_workers: 0,
+             next_worker_id: 0,
+@@ -78,6 +79,11 @@
+     runnable: VecDeque<Task>,
+     /// Tasks waiting for I/O or other events
+     waiting: HashMap<TaskId, Task>,
++    /// Task IDs that were goready'd before gopark completed.
++    /// This handles the race where goready is called between channel unlock
++    /// and gopark's insertion into the waiting map.
++    /// (Go solves this with chanparkcommit; we use this simpler approach.)
++    pending_ready: HashSet<TaskId>,
+     /// Number of idle workers (waiting on condvar)
+     idle_workers: usize,
+     /// Total number of workers
+@@ -94,6 +100,7 @@
+     // - All workers are idle
+     queue.runnable.is_empty()
+         && queue.waiting.is_empty()
++        && queue.pending_ready.is_empty()
+         && !network_poller().has_waiters()
+         && !has_timers()
+         && queue.idle_workers == queue.all_workers
+@@ -140,6 +147,7 @@
+                         // Check termination (like Go's checkdead() in mput())
+                         let should_term = q.runnable.is_empty()
+                             && q.waiting.is_empty()
++                            && q.pending_ready.is_empty()
+                             && !has_net_waiters
+                             && !has_timer_waiters
+                             && q.idle_workers == q.all_workers;
+@@ -198,9 +206,20 @@
+                         // Task finished, drop it
+                     }
+                     TaskState::Waiting => {
+-                        // gopark was called - move task to waiting map
++                        // gopark was called - check if goready was already called
+                         let mut q = queue.lock().unwrap();
+-                        q.waiting.insert(task.id, task);
++                        if q.pending_ready.remove(&task.id) {
++                            // goready was called before we got here.
++                            // Put the task directly into the runnable queue.
++                            task.state = TaskState::Runnable;
++                            q.runnable.push_back(task);
++                            if q.idle_workers > 0 {
++                                condvar.notify_one();
++                            }
++                        } else {
++                            // Normal case: move task to waiting map
++                            q.waiting.insert(task.id, task);
++                        }
+                     }
+                     _ => {
+                         // Normal yield (gosched), put back to runnable queue
+@@ -251,6 +270,10 @@
+ }
+ 
+ /// Wake up a parked task (move back to runnable state)
++///
++/// If the task is not yet in the waiting map (gopark hasn't completed),
++/// it is added to pending_ready so the worker loop will put it directly
++/// into the runnable queue instead of the waiting map.
+ pub fn goready(task_id: TaskId) {
+     let queue = global_queue();
+     let condvar = worker_condvar();
+@@ -265,6 +288,10 @@
+         if q.idle_workers > 0 {
+             condvar.notify_one();
+         }
++    } else {
++        // Task not in waiting map yet (gopark hasn't completed).
++        // Record it so the worker loop will put it directly into runnable.
++        q.pending_ready.insert(task_id);
+     }
+ }
+ 
+@@ -589,3 +616,211 @@
+ 
+     true
+ }
++
++// ============================================================================
++// Channel (Go: chan.go)
++// ============================================================================
++
++use std::sync::Arc;
++
++/// A sender waiting in the sendq (Go: sudog for sender)
++struct SendWaiter<T> {
++    task_id: TaskId, // Go: sudog.g
++    data: T,         // Go: sudog.elem
++}
++
++/// Channel inner state (Go: hchan)
++struct ChanInner<T> {
++    /// Internal buffer (Go: buf with sendx/recvx as ring buffer)
++    buf: VecDeque<T>,
++    /// Buffer capacity (0 = unbuffered) (Go: dataqsiz)
++    buf_cap: usize,
++    /// Senders blocked waiting for a receiver (Go: sendq)
++    sendq: VecDeque<SendWaiter<T>>,
++    /// Receiver task IDs blocked waiting for a sender (Go: recvq)
++    recvq: VecDeque<TaskId>,
++    /// Data delivered to a receiver via direct send (Go: sendDirect alternative)
++    /// Key is the receiver's task ID; value is the data sent to it.
++    delivered: HashMap<TaskId, T>,
++    /// Whether the channel has been closed (Go: closed)
++    closed: bool,
++}
++
++/// Channel for communication between goroutines (Go: hchan)
++///
++/// Channels are the CSP primitive. An unbuffered channel (cap=0) blocks
++/// until both sender and receiver are ready. A buffered channel (cap>0)
++/// blocks the sender only when the buffer is full, and the receiver only
++/// when the buffer is empty. Under the hood, this is just another
++/// application of gopark/goready.
++pub struct Chan<T> {
++    inner: Arc<Mutex<ChanInner<T>>>,
++}
++
++impl<T> Clone for Chan<T> {
++    fn clone(&self) -> Self {
++        Chan {
++            inner: Arc::clone(&self.inner),
++        }
++    }
++}
++
++impl<T: Send + 'static> Default for Chan<T> {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl<T: Send + 'static> Chan<T> {
++    /// Create a new unbuffered channel (Go: make(chan T))
++    pub fn new() -> Self {
++        Self::with_capacity(0)
++    }
++
++    /// Create a new buffered channel (Go: make(chan T, cap))
++    pub fn with_capacity(cap: usize) -> Self {
++        Chan {
++            inner: Arc::new(Mutex::new(ChanInner {
++                buf: VecDeque::with_capacity(cap),
++                buf_cap: cap,
++                sendq: VecDeque::new(),
++                recvq: VecDeque::new(),
++                delivered: HashMap::new(),
++                closed: false,
++            })),
++        }
++    }
++
++    /// Send a value on the channel (Go: chansend, chan.go:176-310)
++    ///
++    /// Blocks until a receiver is ready or the buffer has space.
++    /// Panics if the channel is closed (Go: chan.go:224-227).
++    pub fn send(&self, data: T) {
++        {
++            let mut inner = self.inner.lock().unwrap();
++
++            // Closed channel check (Go: chan.go:224-227)
++            if inner.closed {
++                panic!("send on closed channel");
++            }
++
++            // Fast path: a receiver is already waiting (Go: chan.go:229-234)
++            if let Some(receiver_id) = inner.recvq.pop_front() {
++                // Deliver data directly to the receiver (Go: send → sendDirect)
++                inner.delivered.insert(receiver_id, data);
++                drop(inner); // unlock before goready (Go: chan.go:341)
++                goready(receiver_id); // Go: chan.go:350
++                return;
++            }
++
++            // Buffer has space (Go: chan.go:236-250)
++            if inner.buf.len() < inner.buf_cap {
++                inner.buf.push_back(data);
++                return;
++            }
++
++            // Slow path: no receiver and buffer full, block (Go: chan.go:257-309)
++            let task_id = current_task_id();
++            inner.sendq.push_back(SendWaiter { task_id, data });
++            // unlock before gopark
++        }
++
++        gopark(); // Go: gopark(chanparkcommit, ...) — we use pending_ready instead
++
++        // Woken up by close (Go: chan.go:303-308)
++        let inner = self.inner.lock().unwrap();
++        if inner.closed {
++            panic!("send on closed channel");
++        }
++    }
++
++    /// Receive a value from the channel (Go: chanrecv, chan.go:524-686)
++    ///
++    /// Returns `Some(value)` on success, `None` if the channel is closed
++    /// and empty (Go: chan.go:588-598).
++    pub fn recv(&self) -> Option<T> {
++        {
++            let mut inner = self.inner.lock().unwrap();
++
++            // Closed + no pending data → return None (Go: chan.go:588-598)
++            if inner.closed && inner.sendq.is_empty() && inner.buf.is_empty() {
++                return None;
++            }
++
++            // A sender is already waiting (Go: chan.go:602-609)
++            if let Some(sender) = inner.sendq.pop_front() {
++                let data;
++                let sender_id = sender.task_id;
++
++                if inner.buf_cap == 0 {
++                    // Unbuffered: take data directly from sender (Go: recvDirect)
++                    data = sender.data;
++                } else {
++                    // Buffered + full: dequeue from buffer, enqueue sender's data
++                    // (Go: chan.go:613-629 recv() buffered path)
++                    data = inner.buf.pop_front().unwrap();
++                    inner.buf.push_back(sender.data);
++                }
++
++                drop(inner); // unlock before goready
++                goready(sender_id); // wake the sender
++                return Some(data);
++            }
++
++            // Buffer has data (Go: chan.go:612-629)
++            if let Some(data) = inner.buf.pop_front() {
++                return Some(data);
++            }
++
++            // Closed + empty → return None
++            if inner.closed {
++                return None;
++            }
++
++            // Slow path: no sender and buffer empty, block (Go: chan.go:636-686)
++            let task_id = current_task_id();
++            inner.recvq.push_back(task_id);
++            // unlock before gopark
++        }
++
++        gopark(); // Go: gopark(chanparkcommit, ...) — we use pending_ready instead
++
++        // Woken up — check if data was delivered or if we were woken by close
++        // Some(data) = normal wakeup (Go: success=true)
++        // None = woken by close (Go: success=false)
++        let mut inner = self.inner.lock().unwrap();
++        inner.delivered.remove(&current_task_id())
++    }
++
++    /// Close the channel (Go: closechan, chan.go:414-486)
++    ///
++    /// Wakes all waiting senders (they will panic) and receivers (they get None).
++    /// Panics if the channel is already closed.
++    pub fn close(&self) {
++        let (receivers, senders) = {
++            let mut inner = self.inner.lock().unwrap();
++
++            // Already closed → panic (Go: chan.go:425-426)
++            if inner.closed {
++                panic!("close of closed channel");
++            }
++
++            inner.closed = true; // Go: chan.go:434
++
++            // Collect all waiters (Go: chan.go:439-477)
++            let receivers: Vec<TaskId> = inner.recvq.drain(..).collect();
++            let senders: Vec<TaskId> = inner.sendq.drain(..).map(|w| w.task_id).collect();
++
++            (receivers, senders)
++            // unlock here (Go: chan.go:478)
++        };
++
++        // Wake all waiters outside the lock (Go: chan.go:481-485)
++        for id in receivers {
++            goready(id);
++        }
++        for id in senders {
++            goready(id);
++        }
++    }
++}
