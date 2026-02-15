@@ -631,6 +631,10 @@ struct SendWaiter<T> {
 
 /// Channel inner state (Go: hchan)
 struct ChanInner<T> {
+    /// Internal buffer (Go: buf with sendx/recvx as ring buffer)
+    buf: VecDeque<T>,
+    /// Buffer capacity (0 = unbuffered) (Go: dataqsiz)
+    buf_cap: usize,
     /// Senders blocked waiting for a receiver (Go: sendq)
     sendq: VecDeque<SendWaiter<T>>,
     /// Receiver task IDs blocked waiting for a sender (Go: recvq)
@@ -640,11 +644,13 @@ struct ChanInner<T> {
     delivered: HashMap<TaskId, T>,
 }
 
-/// Unbuffered channel for communication between goroutines (Go: hchan)
+/// Channel for communication between goroutines (Go: hchan)
 ///
-/// Channels are the CSP primitive: sending blocks until a receiver is ready,
-/// and receiving blocks until a sender is ready. Under the hood, this is
-/// just another application of gopark/goready.
+/// Channels are the CSP primitive. An unbuffered channel (cap=0) blocks
+/// until both sender and receiver are ready. A buffered channel (cap>0)
+/// blocks the sender only when the buffer is full, and the receiver only
+/// when the buffer is empty. Under the hood, this is just another
+/// application of gopark/goready.
 pub struct Chan<T> {
     inner: Arc<Mutex<ChanInner<T>>>,
 }
@@ -658,10 +664,17 @@ impl<T> Clone for Chan<T> {
 }
 
 impl<T: Send + 'static> Chan<T> {
-    /// Create a new unbuffered channel
+    /// Create a new unbuffered channel (Go: make(chan T))
     pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// Create a new buffered channel (Go: make(chan T, cap))
+    pub fn with_capacity(cap: usize) -> Self {
         Chan {
             inner: Arc::new(Mutex::new(ChanInner {
+                buf: VecDeque::with_capacity(cap),
+                buf_cap: cap,
                 sendq: VecDeque::new(),
                 recvq: VecDeque::new(),
                 delivered: HashMap::new(),
@@ -671,7 +684,7 @@ impl<T: Send + 'static> Chan<T> {
 
     /// Send a value on the channel (Go: chansend, chan.go:176-310)
     ///
-    /// Blocks until a receiver is ready to receive the value.
+    /// Blocks until a receiver is ready or the buffer has space.
     pub fn send(&self, data: T) {
         {
             let mut inner = self.inner.lock().unwrap();
@@ -685,7 +698,13 @@ impl<T: Send + 'static> Chan<T> {
                 return;
             }
 
-            // Slow path: no receiver, block (Go: chan.go:257-309)
+            // Buffer has space (Go: chan.go:236-250)
+            if inner.buf.len() < inner.buf_cap {
+                inner.buf.push_back(data);
+                return;
+            }
+
+            // Slow path: no receiver and buffer full, block (Go: chan.go:257-309)
             let task_id = current_task_id();
             inner.sendq.push_back(SendWaiter { task_id, data });
             // unlock before gopark
@@ -696,22 +715,38 @@ impl<T: Send + 'static> Chan<T> {
 
     /// Receive a value from the channel (Go: chanrecv, chan.go:524-686)
     ///
-    /// Blocks until a sender sends a value.
+    /// Blocks until a value is available.
     /// Returns `Some(value)` on success.
     pub fn recv(&self) -> Option<T> {
         {
             let mut inner = self.inner.lock().unwrap();
 
-            // Fast path: a sender is already waiting (Go: chan.go:602-609)
+            // A sender is already waiting (Go: chan.go:602-609)
             if let Some(sender) = inner.sendq.pop_front() {
-                let data = sender.data;
+                let data;
                 let sender_id = sender.task_id;
+
+                if inner.buf_cap == 0 {
+                    // Unbuffered: take data directly from sender (Go: recvDirect)
+                    data = sender.data;
+                } else {
+                    // Buffered + full: dequeue from buffer, enqueue sender's data
+                    // (Go: chan.go:613-629 recv() buffered path)
+                    data = inner.buf.pop_front().unwrap();
+                    inner.buf.push_back(sender.data);
+                }
+
                 drop(inner); // unlock before goready
                 goready(sender_id); // wake the sender
                 return Some(data);
             }
 
-            // Slow path: no sender, block (Go: chan.go:636-686)
+            // Buffer has data (Go: chan.go:612-629)
+            if let Some(data) = inner.buf.pop_front() {
+                return Some(data);
+            }
+
+            // Slow path: no sender and buffer empty, block (Go: chan.go:636-686)
             let task_id = current_task_id();
             inner.recvq.push_back(task_id);
             // unlock before gopark
